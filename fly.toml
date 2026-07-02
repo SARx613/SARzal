@@ -3,8 +3,11 @@ primary_region = 'ams'
 
 [build]
 
-# Pas de [http_service] = mode worker pur (pas de port exposé)
-# Le moniteur CESAL tourne en boucle infinie via src/loop.js
+# Aucun [http_service] ni [[services]] = worker pur, pas de port exposé
+# La commande de démarrage est définie dans le Dockerfile (CMD ["sh", "start.sh"])
+
+[processes]
+  app = "sh start.sh"
 
 [[vm]]
   size = 'shared-cpu-1x'
