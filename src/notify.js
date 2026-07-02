@@ -1,6 +1,19 @@
 import { config } from './config.js';
 
 /**
+ * Escapes HTML special characters so that raw strings (e.g. error messages)
+ * can be safely embedded inside parse_mode:'HTML' Telegram messages without
+ * triggering a "Bad Request: can't parse entities" error.
+ */
+export function escapeHtml(str) {
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+/**
  * Envoie un message Telegram. Silencieux (log seulement) si non configuré,
  * pour ne pas casser le moniteur pendant la phase de mise au point.
  */

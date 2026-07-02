@@ -1,6 +1,6 @@
 import { chromium } from 'playwright';
 import { config, URLS, STORAGE_STATE } from './config.js';
-import { notify, notifyPhoto } from './notify.js';
+import { notify, notifyPhoto, escapeHtml } from './notify.js';
 
 /**
  * RÉSERVATION AUTOMATIQUE (mode reserve)
@@ -11,21 +11,64 @@ import { notify, notifyPhoto } from './notify.js';
  *   2. Sélectionner la dernière date d'arrivée (select2) + date de sortie
  *   3. Cliquer "Valider" → la grille des résidences se charge
  *   4. Cliquer sur la carte de la résidence dispo (#residence_X)
- *   5. Cocher la 1re aile dispo (#check_batiment_X_Y)
- *   6. Cocher le 1er escalier dispo (#check_cage_X_Y_Z)
- *   7. Cocher le 1er niveau dispo (#check_niveau_X_Y_Z_W)
+ *   5. Cocher la 1re aile dispo  ← découverte LIVE depuis la page
+ *   6. Cocher le 1er escalier dispo  ← découverte LIVE
+ *   7. Cocher le 1er niveau dispo  ← découverte LIVE
  *      → le tableau "Logements disponibles" apparaît via AJAX
  *   8. Cliquer "Réserver" dans ce tableau
  *      → le formulaire #formulaire_voeu apparaît
  *   9. Cliquer "Valider votre réservation" (submit_reservation())
  *
+ * ⚠️  Les nœuds batiment/cage/niveau ne sont PAS dans `nodes` (ils sont chargés
+ *     en AJAX uniquement quand on clique sur une résidence dans le navigateur).
+ *     On les découvre donc directement depuis la page Playwright.
+ *
  * 📸 Chaque étape envoie un screenshot sur Telegram pour documentation
  *    et permet d'améliorer les sélecteurs si besoin.
  *
  * @param {Array<{id:string,label:string,text:string}>} dispoResidences
- * @param {Object} nodes  tous les nœuds parsés (residence/batiment/cage/niveau)
+ * @param {Object} _nodes  ignoré — les sous-niveaux sont découverts live sur la page
  */
-export async function reserve(dispoResidences, nodes) {
+
+/**
+ * Trouve la première checkbox visible+activée dont l'id commence par `prefix`.
+ * Retourne { checkbox, id } ou null si aucune n'est trouvée avant le timeout.
+ */
+async function findFirstCheckbox(page, prefix, timeoutMs = 6000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const all = page.locator(`input[type="checkbox"][id^="${prefix}"]`);
+    const count = await all.count().catch(() => 0);
+    for (let i = 0; i < count; i++) {
+      const el = all.nth(i);
+      const visible = await el.isVisible().catch(() => false);
+      const enabled = await el.isEnabled().catch(() => false);
+      if (!visible || !enabled) continue;
+
+      const id = await el.getAttribute('id');
+
+      // L'indicateur de dispo est un <h6 id="{nodeId}_logements_disponibles">
+      // ex: check_cage_5_A_N → cage_5_A_N_logements_disponibles
+      const nodeId = id.replace(/^check_/, '');
+      const statusEl = page.locator(`#${nodeId}_logements_disponibles`);
+      const statusText = await statusEl.textContent().catch(() => null);
+
+      // Si l'élément n'existe pas encore ou est vide → données pas encore chargées
+      if (statusText === null || statusText.trim() === '') continue;
+
+      // Si "Aucun logement disponible" → on passe à la suivante
+      if (/aucun logement/i.test(statusText)) continue;
+
+      // Logement dispo ! On retourne cette checkbox.
+      console.log(`[reserve] Dispo trouvée : ${id} — "${statusText.trim()}"`);
+      return { checkbox: el, id };
+    }
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  return null;
+}
+
+export async function reserve(dispoResidences, _nodes) {
   const browser = await chromium.launch({ headless: config.headless });
   const context = await browser.newContext({ storageState: STORAGE_STATE });
   const page = await context.newPage();
@@ -73,40 +116,52 @@ export async function reserve(dispoResidences, nodes) {
     const resNum = target.id.replace('residence_', '');
 
     await page.locator(`#${target.id}`).click({ timeout: 5000 });
-    await page.waitForTimeout(600);
+    // Laisser le temps aux cases batiment de s'afficher via AJAX
+    await page.waitForTimeout(1200);
     await screenshot('E', `Résidence cliquée : ${target.label}`);
 
-    // ── Étape F : cocher la première aile disponible ─────────────────────────
-    const availAile = Object.keys(nodes).find((id) =>
-      new RegExp(`^batiment_${resNum}_[A-Z]$`).test(id) && nodes[id].available
-    );
-    if (!availAile) throw new Error(`Aucune aile disponible pour ${target.label}`);
-    const aileNum = availAile.split('_')[2];
+    // ── Étape F : cocher la première aile disponible (découverte live) ────────
+    // Les cases #check_batiment_N_X sont injectées en AJAX après le clic résidence.
+    const aileResult = await findFirstCheckbox(page, `check_batiment_${resNum}_`);
+    if (!aileResult) {
+      await screenshot('F_ERREUR', '❌ Aucune case batiment trouvée sur la page');
+      throw new Error(`Aucune aile trouvée sur la page pour ${target.label}`);
+    }
+    const { checkbox: aileCheckbox, id: aileId } = aileResult;
+    // L'id est "check_batiment_N_X" → on extrait la lettre de l'aile
+    const aileNum = aileId.replace(`check_batiment_${resNum}_`, '');
+    console.log(`[reserve] Aile trouvée : ${aileId}`);
 
-    await page.locator(`#check_${availAile}`).check({ timeout: 5000 });
-    await page.waitForTimeout(600);
+    await aileCheckbox.check({ timeout: 5000 });
+    await page.waitForTimeout(800);
     await screenshot('F', `Aile cochée : Aile ${aileNum}`);
 
-    // ── Étape G : cocher le premier escalier disponible ──────────────────────
-    const availCage = Object.keys(nodes).find((id) =>
-      id.startsWith(`cage_${resNum}_${aileNum}_`) && nodes[id].available
-    );
-    if (!availCage) throw new Error(`Aucun escalier disponible pour Aile ${aileNum}`);
-    const cageIdx = availCage.split('_')[3];
+    // ── Étape G : cocher le premier escalier disponible (découverte live) ─────
+    const cageResult = await findFirstCheckbox(page, `check_cage_${resNum}_${aileNum}_`);
+    if (!cageResult) {
+      await screenshot('G_ERREUR', '❌ Aucune case cage/escalier trouvée sur la page');
+      throw new Error(`Aucun escalier trouvé sur la page pour Aile ${aileNum}`);
+    }
+    const { checkbox: cageCheckbox, id: cageId } = cageResult;
+    const cageIdx = cageId.replace(`check_cage_${resNum}_${aileNum}_`, '');
+    console.log(`[reserve] Cage trouvée : ${cageId}`);
 
-    await page.locator(`#check_${availCage}`).check({ timeout: 5000 });
-    await page.waitForTimeout(600);
-    await screenshot('G', 'Escalier coché');
+    await cageCheckbox.check({ timeout: 5000 });
+    await page.waitForTimeout(800);
+    await screenshot('G', `Escalier coché : escalier ${cageIdx}`);
 
-    // ── Étape H : cocher le premier niveau disponible ────────────────────────
-    const availNiveau = Object.keys(nodes).find((id) =>
-      id.startsWith(`niveau_${resNum}_${aileNum}_${cageIdx}_`) && nodes[id].available
-    );
-    if (!availNiveau) throw new Error('Aucun niveau disponible');
-    const nivNum = availNiveau.split('_')[4];
-    const chemin = `${target.label} › Aile ${aileNum} › Niveau R+${nivNum}`;
+    // ── Étape H : cocher le premier niveau disponible (découverte live) ───────
+    const niveauResult = await findFirstCheckbox(page, `check_niveau_${resNum}_${aileNum}_${cageIdx}_`);
+    if (!niveauResult) {
+      await screenshot('H_ERREUR', '❌ Aucune case niveau trouvée sur la page');
+      throw new Error('Aucun niveau trouvé sur la page');
+    }
+    const { checkbox: niveauCheckbox, id: niveauId } = niveauResult;
+    const nivNum = niveauId.replace(`check_niveau_${resNum}_${aileNum}_${cageIdx}_`, '');
+    const chemin = `${target.label} › Aile ${aileNum} › Escalier ${cageIdx} › Niveau R+${nivNum}`;
+    console.log(`[reserve] Niveau trouvé : ${niveauId}`);
 
-    await page.locator(`#check_${availNiveau}`).check({ timeout: 5000 });
+    await niveauCheckbox.check({ timeout: 5000 });
 
     // Attendre le chargement AJAX du tableau "Logements disponibles"
     await page.waitForTimeout(2000);
@@ -168,7 +223,7 @@ export async function reserve(dispoResidences, nodes) {
     // Screenshot d'erreur + notification
     try {
       const buf = await page.screenshot({ fullPage: true });
-      await notifyPhoto(`❌ <b>Erreur réservation</b>\n<code>${err.message}</code>`, buf);
+      await notifyPhoto(`❌ <b>Erreur réservation</b>\n<code>${escapeHtml(err.message)}</code>`, buf);
     } catch {}
     throw err;
   } finally {

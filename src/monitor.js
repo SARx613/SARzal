@@ -1,6 +1,6 @@
 import fs from 'fs';
 import { config, URLS, STORAGE_STATE } from './config.js';
-import { notify } from './notify.js';
+import { notify, escapeHtml } from './notify.js';
 
 /**
  * Stratégie (déduite du HAR réel) :
@@ -219,7 +219,7 @@ export async function checkOnce() {
         const { reserve } = await import('./reserve.js');
         await reserve(dispoResidences, nodes);
       } catch (err) {
-        await notify(`⚠️ Réservation auto échouée : ${err.message}. Réserve à la main : ${URLS.reservation}`);
+        await notify(`⚠️ Réservation auto échouée : <code>${escapeHtml(err.message)}</code>\nRéserve à la main : ${URLS.reservation}`);
       }
     }
     return { available: true, nodes };
