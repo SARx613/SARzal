@@ -1,11 +1,11 @@
 import { chromium } from 'playwright';
 import { config, URLS, STORAGE_STATE } from './config.js';
-import { notify } from './notify.js';
+import { notify, notifyPhoto } from './notify.js';
 
 /**
  * RÉSERVATION AUTOMATIQUE (mode reserve)
  *
- * Flux réel déduit du HTML de la page :
+ * Flux complet validé sur le HTML réel :
  *
  *   1. Aller sur la page de réservation
  *   2. Sélectionner la dernière date d'arrivée (select2) + date de sortie
@@ -14,10 +14,13 @@ import { notify } from './notify.js';
  *   5. Cocher la 1re aile dispo (#check_batiment_X_Y)
  *   6. Cocher le 1er escalier dispo (#check_cage_X_Y_Z)
  *   7. Cocher le 1er niveau dispo (#check_niveau_X_Y_Z_W)
- *      → déclenche le chargement AJAX du tableau "Logements disponibles"
- *   8. Cliquer le bouton "Réserver" dans ce tableau
+ *      → le tableau "Logements disponibles" apparaît via AJAX
+ *   8. Cliquer "Réserver" dans ce tableau
+ *      → le formulaire #formulaire_voeu apparaît
+ *   9. Cliquer "Valider votre réservation" (submit_reservation())
  *
- * ⚠️ Chaque étape dumpe le HTML dans config/reserve_step_*.html pour debug.
+ * 📸 Chaque étape envoie un screenshot sur Telegram pour documentation
+ *    et permet d'améliorer les sélecteurs si besoin.
  *
  * @param {Array<{id:string,label:string,text:string}>} dispoResidences
  * @param {Object} nodes  tous les nœuds parsés (residence/batiment/cage/niveau)
@@ -27,19 +30,26 @@ export async function reserve(dispoResidences, nodes) {
   const context = await browser.newContext({ storageState: STORAGE_STATE });
   const page = await context.newPage();
 
-  const dump = async (name) => {
+  /** Prend un screenshot et l'envoie sur Telegram + le sauvegarde localement. */
+  const screenshot = async (stepName, caption) => {
     try {
-      const p = new URL(`../config/reserve_step_${name}.html`, import.meta.url).pathname;
+      const buf = await page.screenshot({ fullPage: true });
+      // Envoi Telegram
+      await notifyPhoto(`📸 <b>Étape ${stepName}</b>\n${caption}`, buf);
+      // Sauvegarde locale pour debug
       const { writeFileSync } = await import('fs');
-      writeFileSync(p, await page.content());
-    } catch {}
+      const p = new URL(`../config/reserve_step_${stepName}.png`, import.meta.url).pathname;
+      writeFileSync(p, buf);
+    } catch (e) {
+      console.warn(`[reserve] Screenshot ${stepName} échoué:`, e.message);
+    }
   };
 
   try {
     // ── Étape A : page de réservation ────────────────────────────────────────
     await page.goto(URLS.reservation, { waitUntil: 'domcontentloaded' });
     if (/login/i.test(page.url())) throw new Error('SESSION_EXPIRED');
-    await dump('A_reservation');
+    await screenshot('A', 'Page de réservation chargée');
 
     // ── Étape B : sélectionner la dernière date d'arrivée (select2) ──────────
     await page.locator('#select2-date_arrivee-container').click({ timeout: 5000 }).catch(() => {});
@@ -55,7 +65,8 @@ export async function reserve(dispoResidences, nodes) {
       page.waitForLoadState('domcontentloaded'),
       page.locator('button:has-text("Valider")').first().click(),
     ]).catch(() => {});
-    await dump('D_grille');
+    await page.waitForTimeout(800);
+    await screenshot('D', 'Grille des résidences après Valider');
 
     // ── Étape E : cliquer sur la carte de la résidence ───────────────────────
     const target = dispoResidences[0];
@@ -63,7 +74,7 @@ export async function reserve(dispoResidences, nodes) {
 
     await page.locator(`#${target.id}`).click({ timeout: 5000 });
     await page.waitForTimeout(600);
-    await dump('E_residence_cliquee');
+    await screenshot('E', `Résidence cliquée : ${target.label}`);
 
     // ── Étape F : cocher la première aile disponible ─────────────────────────
     const availAile = Object.keys(nodes).find((id) =>
@@ -74,7 +85,7 @@ export async function reserve(dispoResidences, nodes) {
 
     await page.locator(`#check_${availAile}`).check({ timeout: 5000 });
     await page.waitForTimeout(600);
-    await dump('F_aile_cochee');
+    await screenshot('F', `Aile cochée : Aile ${aileNum}`);
 
     // ── Étape G : cocher le premier escalier disponible ──────────────────────
     const availCage = Object.keys(nodes).find((id) =>
@@ -85,43 +96,80 @@ export async function reserve(dispoResidences, nodes) {
 
     await page.locator(`#check_${availCage}`).check({ timeout: 5000 });
     await page.waitForTimeout(600);
-    await dump('G_cage_cochee');
+    await screenshot('G', 'Escalier coché');
 
     // ── Étape H : cocher le premier niveau disponible ────────────────────────
     const availNiveau = Object.keys(nodes).find((id) =>
       id.startsWith(`niveau_${resNum}_${aileNum}_${cageIdx}_`) && nodes[id].available
     );
-    if (!availNiveau) throw new Error(`Aucun niveau disponible`);
+    if (!availNiveau) throw new Error('Aucun niveau disponible');
     const nivNum = availNiveau.split('_')[4];
+    const chemin = `${target.label} › Aile ${aileNum} › Niveau R+${nivNum}`;
 
     await page.locator(`#check_${availNiveau}`).check({ timeout: 5000 });
 
-    // Attendre le tableau AJAX "Logements disponibles" (peut prendre 1-2 s)
-    await page.waitForTimeout(1500);
-    await dump('H_niveau_coche');
+    // Attendre le chargement AJAX du tableau "Logements disponibles"
+    await page.waitForTimeout(2000);
+    await screenshot('H', `Niveau coché : ${chemin}\nTableau "Logements disponibles" attendu`);
 
     // ── Étape I : cliquer "Réserver" dans le tableau ──────────────────────────
-    const reserverBtn = page.locator(
-      'button:has-text("Réserver"), a:has-text("Réserver"), input[value="Réserver"]'
+    // On essaie plusieurs sélecteurs car le texte exact peut varier
+    const reserverSelectors = [
+      'button:has-text("Réserver")',
+      'a:has-text("Réserver")',
+      'input[value="Réserver"]',
+      'button:has-text("réserver")',
+      '[onclick*="reserver"]',
+      '[onclick*="Reserver"]',
+      '.btn:has-text("Réser")',
+    ];
+    let reserverBtn = null;
+    for (const sel of reserverSelectors) {
+      const el = page.locator(sel).first();
+      if (await el.isVisible({ timeout: 2000 }).catch(() => false)) {
+        reserverBtn = el;
+        console.log(`[reserve] Bouton Réserver trouvé avec : ${sel}`);
+        break;
+      }
+    }
+
+    if (!reserverBtn) {
+      await screenshot('I_ERREUR', '❌ Bouton "Réserver" introuvable dans le tableau');
+      throw new Error('Bouton Réserver introuvable — voir screenshot étape I_ERREUR');
+    }
+
+    await screenshot('I', 'Tableau "Logements disponibles" — bouton Réserver trouvé');
+    await reserverBtn.click();
+    await page.waitForTimeout(1500);
+    await screenshot('I2', 'Après clic Réserver — formulaire de confirmation attendu');
+
+    // ── Étape J : formulaire de confirmation #formulaire_voeu ─────────────────
+    // Attendre que le formulaire de confirmation soit visible
+    await page.locator('#formulaire_voeu').waitFor({ state: 'visible', timeout: 10000 });
+    await screenshot('J', 'Formulaire "Votre réservation de logement" — détails du logement');
+
+    // Cliquer "Valider votre réservation" (appelle submit_reservation() en JS)
+    const validerBtn = page.locator(
+      'button:has-text("Valider votre réservation"), [onclick*="submit_reservation"]'
     ).first();
+    await validerBtn.waitFor({ state: 'visible', timeout: 5000 });
+    await validerBtn.click();
 
-    await reserverBtn.waitFor({ state: 'visible', timeout: 10000 });
-    await dump('I_avant_reserver');
+    await page.waitForTimeout(2000);
+    await screenshot('K', 'Après "Valider votre réservation" — résultat final');
 
-    await Promise.all([
-      page.waitForLoadState('domcontentloaded'),
-      reserverBtn.click(),
-    ]);
-    await dump('J_apres_reserver');
-
-    const chemin = `${target.label} › Aile ${aileNum} › Niveau R+${nivNum}`;
     await notify(
       `✅ <b>Réservation tentée !</b>\n\n` +
       `📍 ${chemin}\n\n` +
-      `⚠️ VÉRIFIE sur le site que c'est bien confirmé : ${URLS.reservation}`
+      `⚠️ VÉRIFIE sur le site que la réservation est bien confirmée :\n${URLS.reservation}`
     );
+
   } catch (err) {
-    await dump('ERROR');
+    // Screenshot d'erreur + notification
+    try {
+      const buf = await page.screenshot({ fullPage: true });
+      await notifyPhoto(`❌ <b>Erreur réservation</b>\n<code>${err.message}</code>`, buf);
+    } catch {}
     throw err;
   } finally {
     await browser.close();
