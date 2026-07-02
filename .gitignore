@@ -1,5 +1,8 @@
 node_modules/
 .env
+.DS_Store
 config/session.json
 config/step_*.html
+config/reserve_step_*.html
+config/last_response.html
 *.har
