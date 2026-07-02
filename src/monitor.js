@@ -78,11 +78,45 @@ function availableResidences(nodes) {
     .map(([id, v]) => ({ id, label: LABELS[id] || id, text: v.text }));
 }
 
-/** Renvoie TOUT noeud dispo (résidence, bâtiment, aile, niveau) pour le détail. */
-function allAvailableNodes(nodes) {
-  return Object.entries(nodes)
-    .filter(([, v]) => v.available)
-    .map(([id, v]) => ({ id, text: v.text }));
+/**
+ * Construit le texte de notification hiérarchisé :
+ *   🟢 Résidence I — 3 logements disponibles
+ *      ↳ Aile A — 2 logements disponibles
+ *         ↳ Niveau R+1 — 2 logements disponibles
+ */
+function buildDispoMessage(dispoResidences, nodes) {
+  const lines = [];
+  for (const res of dispoResidences) {
+    lines.push(`🟢 <b>${res.label}</b> — ${res.text}`);
+    const resNum = res.id.replace('residence_', '');
+
+    // Ailes (batiment_N_L)
+    const ailes = Object.entries(nodes)
+      .filter(([id, v]) => v.available && new RegExp(`^batiment_${resNum}_[A-Z]$`).test(id));
+
+    for (const [aileId, aileV] of ailes) {
+      const aileNum = aileId.split('_')[2];
+      lines.push(`   ↳ <b>Aile ${aileNum}</b> — ${aileV.text}`);
+
+      // Cages (cage_N_L_M)
+      const cages = Object.entries(nodes)
+        .filter(([id, v]) => v.available && id.startsWith(`cage_${resNum}_${aileNum}_`));
+
+      for (const [cageId] of cages) {
+        const cageIdx = cageId.split('_')[3];
+
+        // Niveaux (niveau_N_L_M_K)
+        const niveaux = Object.entries(nodes)
+          .filter(([id, v]) => v.available && id.startsWith(`niveau_${resNum}_${aileNum}_${cageIdx}_`));
+
+        for (const [nivId, nivV] of niveaux) {
+          const nivNum = nivId.split('_')[4];
+          lines.push(`      ↳ <b>Niveau R+${nivNum}</b> — ${nivV.text}`);
+        }
+      }
+    }
+  }
+  return lines.join('\n');
 }
 
 async function fetchReservationPage(cookieHeader, dateArrivee) {
@@ -171,13 +205,10 @@ export async function checkOnce() {
   const dispoResidences = availableResidences(nodes);
 
   if (dispoResidences.length > 0) {
-    const detail = allAvailableNodes(nodes)
-      .map((n) => `• <code>${n.id}</code> — ${n.text}`)
-      .join('\n');
     await notify(
       `🏠 <b>LOGEMENT DISPONIBLE CHEZ CESAL !</b>\n\n` +
-        dispoResidences.map((r) => `🟢 ${r.label} — ${r.text}`).join('\n') +
-        `\n\n<b>Détail :</b>\n${detail}\n\n${URLS.reservation}`
+      buildDispoMessage(dispoResidences, nodes) +
+      `\n\n🔗 ${URLS.reservation}`
     );
     if (config.mode === 'reserve') {
       await notify('🤖 Mode reserve activé — lancement de la réservation auto…');
