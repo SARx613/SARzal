@@ -69,9 +69,27 @@ async function findFirstCheckbox(page, prefix, timeoutMs = 6000) {
 }
 
 export async function reserve(dispoResidences, _nodes) {
-  const browser = await chromium.launch({ headless: config.headless });
+  // Sur un conteneur (Fly.io/Docker), Chromium DOIT tourner avec --no-sandbox et
+  // --disable-dev-shm-usage, sinon il se bloque au démarrage (d'où le "gel"
+  // observé : machine started mais loop figée). On met aussi un timeout de launch.
+  await notify('🌐 Ouverture du navigateur pour la réservation…');
+  const browser = await chromium.launch({
+    headless: config.headless,
+    timeout: 60_000,
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--single-process',
+      '--no-zygote',
+    ],
+  });
   const context = await browser.newContext({ storageState: STORAGE_STATE });
   const page = await context.newPage();
+  // Timeout par défaut raisonnable pour toutes les actions Playwright.
+  page.setDefaultTimeout(15_000);
+  page.setDefaultNavigationTimeout(30_000);
 
   /** Prend un screenshot et l'envoie sur Telegram + le sauvegarde localement. */
   const screenshot = async (stepName, caption) => {
@@ -227,6 +245,10 @@ export async function reserve(dispoResidences, _nodes) {
     } catch {}
     throw err;
   } finally {
-    await browser.close();
+    // Fermeture protégée : ne jamais rester bloqué sur close() (browser zombie).
+    await Promise.race([
+      browser.close().catch(() => {}),
+      new Promise((r) => setTimeout(r, 10_000)),
+    ]);
   }
 }

@@ -208,18 +208,29 @@ export async function checkOnce() {
     await notify(
       `🏠 <b>LOGEMENT DISPONIBLE CHEZ CESAL !</b>\n\n` +
       buildDispoMessage(dispoResidences, nodes) +
-      `\n\n🔗 ${URLS.reservation}`
+      `\n\n🤖 Le bot tente la réservation auto (screenshots à suivre).` +
+      `\n⚡ <b>EN BACKUP, réserve TOI AUSSI à la main tout de suite :</b>` +
+      `\n🔗 ${URLS.reservation}`
     );
     if (config.mode === 'reserve') {
       await notify('🤖 Mode reserve activé — lancement de la réservation auto…');
-      // La réservation finale (sélection du noeud + Réserver + Valider) passe par
-      // Playwright car elle implique la navigation select2/datepicker. Implémentée
-      // dans src/reserve.js, appelée ici une fois le flux validé sur le vrai site.
+      // La réservation (Playwright) est protégée par un TIMEOUT GLOBAL DUR : si
+      // elle se bloque (ex. Chromium qui gèle), on abandonne au bout de 3 min et
+      // on RENDS LA MAIN à la surveillance — elle ne doit jamais mourir en silence.
+      const RESERVE_TIMEOUT_MS = 3 * 60_000;
       try {
         const { reserve } = await import('./reserve.js');
-        await reserve(dispoResidences, nodes);
+        await Promise.race([
+          reserve(dispoResidences, nodes),
+          new Promise((_, rej) =>
+            setTimeout(() => rej(new Error('RESERVE_TIMEOUT (>3min, abandon)')), RESERVE_TIMEOUT_MS)
+          ),
+        ]);
       } catch (err) {
-        await notify(`⚠️ Réservation auto échouée : <code>${escapeHtml(err.message)}</code>\nRéserve à la main : ${URLS.reservation}`);
+        await notify(
+          `⚠️ Réservation auto échouée : <code>${escapeHtml(err.message)}</code>\n` +
+          `👉 Réserve VITE à la main : ${URLS.reservation}`
+        );
       }
     }
     return { available: true, nodes };
