@@ -79,6 +79,12 @@ function availableResidences(nodes) {
 }
 
 /**
+ * Résidences pour lesquelles on AUTO-RÉSERVE (les autres → notification seule).
+ * Choix utilisateur : uniquement Résidence III et Résidence IV.
+ */
+const AUTO_RESERVE_RESIDENCE_IDS = new Set(['residence_3', 'residence_4']);
+
+/**
  * Construit le texte de notification hiérarchisé :
  *   🟢 Résidence I — 3 logements disponibles
  *      ↳ Aile A — 2 logements disponibles
@@ -205,15 +211,45 @@ export async function checkOnce() {
   const dispoResidences = availableResidences(nodes);
 
   if (dispoResidences.length > 0) {
-    await notify(
-      `🏠 <b>LOGEMENT DISPONIBLE CHEZ CESAL !</b>\n\n` +
-      buildDispoMessage(dispoResidences, nodes) +
-      `\n\n🤖 Le bot tente la réservation auto (screenshots à suivre).` +
-      `\n⚡ <b>EN BACKUP, réserve TOI AUSSI à la main tout de suite :</b>` +
-      `\n🔗 ${URLS.reservation}`
+    // On ne RÉSERVE réellement que pour les Résidences III / IV. Pour les autres,
+    // on ouvre quand même le navigateur pour prendre les captures (documentation),
+    // mais sans jamais cliquer "Réserver"/"Valider" (commit=false).
+    const autoResidences = dispoResidences.filter((r) =>
+      AUTO_RESERVE_RESIDENCE_IDS.has(r.id)
     );
+    const isEligible = autoResidences.length > 0;
+    // Résidences vers lesquelles diriger la navigation : III/IV en priorité,
+    // sinon la 1re dispo (pour les captures uniquement).
+    const targetResidences = isEligible ? autoResidences : dispoResidences;
+
+    // Message d'alerte — différent selon qu'on va réserver ou juste documenter.
+    if (isEligible) {
+      await notify(
+        `🏠 <b>LOGEMENT DISPONIBLE CHEZ CESAL !</b>\n\n` +
+        buildDispoMessage(dispoResidences, nodes) +
+        `\n\n🎯 <b>Résidence III/IV détectée → le bot tente la réservation auto</b> (screenshots à suivre).` +
+        `\n⚡ <b>EN BACKUP, réserve TOI AUSSI à la main tout de suite :</b>` +
+        `\n🔗 ${URLS.reservation}`
+      );
+    } else {
+      await notify(
+        `🏠 <b>LOGEMENT DISPONIBLE CHEZ CESAL !</b>\n\n` +
+        buildDispoMessage(dispoResidences, nodes) +
+        `\n\nℹ️ <b>Ce n'est PAS une Résidence III/IV</b> → je ne réserve PAS,` +
+        ` mais je fais les captures pour vérification (screenshots à suivre).` +
+        `\n👉 Si ça t'intéresse, réserve à la main :` +
+        `\n🔗 ${URLS.reservation}`
+      );
+    }
+
+    // On lance Playwright dans TOUS les cas (captures), mais commit=true seulement
+    // pour III/IV. Nécessite le mode reserve (sinon pas d'ouverture de navigateur).
     if (config.mode === 'reserve') {
-      await notify('🤖 Mode reserve activé — lancement de la réservation auto…');
+      await notify(
+        isEligible
+          ? '🤖 Lancement de la réservation auto (Résidence III/IV)…'
+          : '📸 Ouverture du navigateur pour les captures (sans réserver)…'
+      );
       // La réservation (Playwright) est protégée par un TIMEOUT GLOBAL DUR : si
       // elle se bloque (ex. Chromium qui gèle), on abandonne au bout de 3 min et
       // on RENDS LA MAIN à la surveillance — elle ne doit jamais mourir en silence.
@@ -221,19 +257,19 @@ export async function checkOnce() {
       try {
         const { reserve } = await import('./reserve.js');
         await Promise.race([
-          reserve(dispoResidences, nodes),
+          reserve(targetResidences, nodes, { commit: isEligible }),
           new Promise((_, rej) =>
             setTimeout(() => rej(new Error('RESERVE_TIMEOUT (>3min, abandon)')), RESERVE_TIMEOUT_MS)
           ),
         ]);
       } catch (err) {
         await notify(
-          `⚠️ Réservation auto échouée : <code>${escapeHtml(err.message)}</code>\n` +
-          `👉 Réserve VITE à la main : ${URLS.reservation}`
+          `⚠️ ${isEligible ? 'Réservation auto' : 'Captures'} en échec : <code>${escapeHtml(err.message)}</code>\n` +
+          `👉 Réserve à la main si besoin : ${URLS.reservation}`
         );
       }
     }
-    return { available: true, nodes };
+    return { available: true, autoReserved: isEligible, nodes };
   }
 
   console.log(`[check] ${new Date().toLocaleTimeString()} — aucune dispo (${Object.keys(nodes).length} noeuds vérifiés).`);
