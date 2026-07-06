@@ -11,4 +11,8 @@ primary_region = 'ams'
 
 [[vm]]
   size = 'shared-cpu-1x'
-  memory = '512mb'  # 256 était trop juste pour lancer Chromium (réservation)
+  memory = '1024mb'  # 512 était encore trop juste : dmesg montrait Chromium
+  # refuser une allocation de 512MB d'un coup (__vm_enough_memory), ce qui
+  # bloquait silencieusement le network service interne (page.goto() qui ne
+  # résout jamais, sans erreur). 256→512 ne suffisait qu'à lancer Chromium,
+  # pas à le faire NAVIGUER en même temps que le monitoring tourne.

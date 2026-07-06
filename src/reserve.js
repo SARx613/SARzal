@@ -28,6 +28,10 @@ import { notify, notifyPhoto, escapeHtml } from './notify.js';
  *
  * @param {Array<{id:string,label:string,text:string}>} dispoResidences
  * @param {Object} _nodes  ignoré — les sous-niveaux sont découverts live sur la page
+ * @param {{commit?: boolean}} [opts]  commit=true → va jusqu'à "Valider votre
+ *        réservation". commit=false → s'arrête AVANT (navigation + captures
+ *        seulement, aucune réservation réelle). Utilisé pour les résidences
+ *        hors III/IV où l'on veut juste documenter la dispo par captures.
  */
 
 /**
@@ -68,23 +72,54 @@ async function findFirstCheckbox(page, prefix, timeoutMs = 6000) {
   return null;
 }
 
-export async function reserve(dispoResidences, _nodes) {
-  // Sur un conteneur (Fly.io/Docker), Chromium DOIT tourner avec --no-sandbox et
-  // --disable-dev-shm-usage, sinon il se bloque au démarrage (d'où le "gel"
-  // observé : machine started mais loop figée). On met aussi un timeout de launch.
+/**
+ * Lance Chromium avec les args nécessaires en conteneur, avec vérification
+ * de connexion + 1 retry. `--single-process`/`--no-zygote` ont été retirés :
+ * ils sont connus pour crasher Chromium silencieusement peu après le launch
+ * sur certains noyaux Linux (le process meurt entre `launch()` et le premier
+ * appel suivant, ex. `newContext()` → "Target ... has been closed").
+ *
+ * ⚠️ Quand `headless: true` est passé à `chromium.launch()`, Playwright choisit
+ * TOUJOURS le binaire allégé `chrome-headless-shell` — peu importe les `args`
+ * fournis, ce choix ne dépend QUE du flag `headless` de l'API, pas des args.
+ * Sur le site CESAL (jQuery/select2/AJAX), ce shell est resté connecté mais
+ * bloquait silencieusement sur `page.goto()` (jamais résolu, jamais d'erreur).
+ * Pour forcer le vrai binaire Chromium en mode headless, il faut passer
+ * `headless: false` à l'API ET ajouter `--headless=new` dans les args (c'est
+ * ce flag qui active le vrai mode headless du binaire complet).
+ */
+async function launchBrowser() {
+  const LAUNCH_ARGS = [
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--disable-dev-shm-usage',
+    '--disable-gpu',
+    '--headless=new',
+  ];
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const browser = await chromium.launch({
+      headless: false, // le vrai mode headless vient de --headless=new dans args
+      timeout: 60_000,
+      args: LAUNCH_ARGS,
+    });
+    // Chromium peut crasher juste après le launch (OOM, incompatibilité noyau).
+    // On laisse un court délai puis on vérifie explicitement la connexion avant
+    // de continuer, plutôt que de découvrir le crash au prochain appel Playwright.
+    await new Promise((r) => setTimeout(r, 300));
+    if (browser.isConnected()) return browser;
+    console.warn(`[reserve] Chromium déconnecté juste après launch (tentative ${attempt}/2)`);
+    await browser.close().catch(() => {});
+    if (attempt === 2) {
+      throw new Error('CHROMIUM_CRASH (déconnecté juste après le launch, 2 tentatives)');
+    }
+  }
+}
+
+export async function reserve(dispoResidences, _nodes, opts = {}) {
+  const { commit = true } = opts;
   await notify('🌐 Ouverture du navigateur pour la réservation…');
-  const browser = await chromium.launch({
-    headless: config.headless,
-    timeout: 60_000,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu',
-      '--single-process',
-      '--no-zygote',
-    ],
-  });
+  const browser = await launchBrowser();
+  browser.on('disconnected', () => console.warn('[reserve] Événement: navigateur déconnecté'));
   const context = await browser.newContext({ storageState: STORAGE_STATE });
   const page = await context.newPage();
   // Timeout par défaut raisonnable pour toutes les actions Playwright.
@@ -119,12 +154,23 @@ export async function reserve(dispoResidences, _nodes) {
     if (n > 0) await opts.nth(n - 1).click();
 
     // ── Étape C : date de sortie ──────────────────────────────────────────────
-    await page.locator('#date_sortie').fill(config.dateSortie, { timeout: 5000 }).catch(() => {});
+    // ⚠️ Le champ #date_sortie est géré par bootstrap-datepicker. `.fill()` pose
+    // la valeur dans le DOM mais le plugin la vide/invalide avant le submit natif
+    // du formulaire (constaté en live : la page relue après "Valider" affiche
+    // "la date de fin de bail ne peut pas être vide"). Taper la date au clavier
+    // (comme un vrai utilisateur) déclenche les events internes du plugin et la
+    // valeur est bien conservée jusqu'au submit.
+    const dateSortieInput = page.locator('#date_sortie');
+    await dateSortieInput.click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(200);
+    await dateSortieInput.pressSequentially(config.dateSortie, { delay: 50, timeout: 5000 }).catch(() => {});
 
     // ── Étape D : Valider → grille des résidences ────────────────────────────
+    // `force: true` car le popup calendrier du datepicker peut rester ouvert et
+    // intercepter le clic normal (l'élément "Valider" est alors masqué dessous).
     await Promise.all([
       page.waitForLoadState('domcontentloaded'),
-      page.locator('button:has-text("Valider")').first().click(),
+      page.locator('button:has-text("Valider")').first().click({ force: true }),
     ]).catch(() => {});
     await page.waitForTimeout(800);
     await screenshot('D', 'Grille des résidences après Valider');
@@ -185,6 +231,19 @@ export async function reserve(dispoResidences, _nodes) {
     await page.waitForTimeout(2000);
     await screenshot('H', `Niveau coché : ${chemin}\nTableau "Logements disponibles" attendu`);
 
+    // ── Mode "captures seulement" (résidences hors III/IV) ────────────────────
+    // On a documenté toute la navigation jusqu'au tableau des logements, mais on
+    // NE clique NI "Réserver" NI "Valider" : aucune réservation réelle n'est faite.
+    if (!commit) {
+      await notify(
+        `📸 <b>Captures terminées (pas de réservation)</b>\n\n` +
+        `📍 ${chemin}\n\n` +
+        `ℹ️ Cette résidence n'est pas III/IV → je n'ai rien réservé.\n` +
+        `👉 Si tu veux la prendre, réserve à la main : ${URLS.reservation}`
+      );
+      return;
+    }
+
     // ── Étape I : cliquer "Réserver" dans le tableau ──────────────────────────
     // On essaie plusieurs sélecteurs car le texte exact peut varier
     const reserverSelectors = [
@@ -221,6 +280,27 @@ export async function reserve(dispoResidences, _nodes) {
     await page.locator('#formulaire_voeu').waitFor({ state: 'visible', timeout: 10000 });
     await screenshot('J', 'Formulaire "Votre réservation de logement" — détails du logement');
 
+    // Extraction des caractéristiques du logement affichées dans le tableau
+    // "Votre réservation de logement" (#tr_formulaire_voeu). Les <td> n'ont pas
+    // d'id individuel : on les récupère par position, dans l'ordre des <th>
+    // (Type logement / Colocation / Nbr occupants / PMR / Surface / Balcon /
+    // Boursier prioritaire / Loyer charges comprises / Dépôt garantie / Frais
+    // de dossier).
+    const logementInfo = await page.locator('#tr_formulaire_voeu td').allTextContents()
+      .then((tds) => ({
+        typeLogement: tds[0]?.trim() || '',
+        colocation: tds[1]?.trim() || '',
+        nbOccupants: tds[2]?.trim() || '',
+        pmr: tds[3]?.trim() || '',
+        surface: tds[4]?.trim() || '',
+        balcon: tds[5]?.trim() || '',
+        boursier: tds[6]?.trim() || '',
+        loyer: tds[7]?.trim() || '',
+        depotGarantie: tds[8]?.trim() || '',
+        fraisDossier: tds[9]?.trim() || '',
+      }))
+      .catch(() => null);
+
     // Cliquer "Valider votre réservation" (appelle submit_reservation() en JS)
     const validerBtn = page.locator(
       'button:has-text("Valider votre réservation"), [onclick*="submit_reservation"]'
@@ -231,9 +311,22 @@ export async function reserve(dispoResidences, _nodes) {
     await page.waitForTimeout(2000);
     await screenshot('K', 'Après "Valider votre réservation" — résultat final');
 
+    const detailsLines = logementInfo
+      ? [
+          `🏷️ Type : ${logementInfo.typeLogement}`,
+          `👥 Colocation : ${logementInfo.colocation}`,
+          `🔢 Nbr occupants : ${logementInfo.nbOccupants}`,
+          `📐 Surface : ${logementInfo.surface}`,
+          `💶 Loyer charges comprises : ${logementInfo.loyer}`,
+          `🔒 Dépôt garantie : ${logementInfo.depotGarantie}`,
+          `📄 Frais de dossier : ${logementInfo.fraisDossier}`,
+        ].join('\n')
+      : '⚠️ Détails du logement non récupérés (structure de page inattendue).';
+
     await notify(
       `✅ <b>Réservation tentée !</b>\n\n` +
       `📍 ${chemin}\n\n` +
+      `${detailsLines}\n\n` +
       `⚠️ VÉRIFIE sur le site que la réservation est bien confirmée :\n${URLS.reservation}`
     );
 
