@@ -73,6 +73,24 @@ async function findFirstCheckbox(page, prefix, timeoutMs = 6000) {
 }
 
 /**
+ * Coche une checkbox de type "toggle switch" (pattern CSS du site : l'input
+ * est imbriqué dans un <label class="switch">...<span></span></label>, le
+ * <span> dessinant visuellement le rond du switch par-dessus l'input réel).
+ * Cliquer directement sur l'input échoue en mode normal ("<span></span>
+ * intercepts pointer events" car le span capte le clic en premier).
+ * `force: true` fait déclencher l'event natif directement sur l'input sans
+ * vérifier qu'il est visuellement atteignable — la page attache ses handlers
+ * `change`/`click` sur l'id de l'input (ex. $("#check_cage_1_A_0").on("click",
+ * ...)), donc c'est suffisant pour déclencher toute la logique JS du site
+ * (affichage du tableau suivant, reset des autres cases du même niveau, etc).
+ * Un clic sur le <label> parent avait été testé mais son effet ne persistait
+ * pas de façon fiable (état revenu à "unchecked" après le re-render AJAX).
+ */
+async function checkToggle(checkbox, timeoutMs = 5000) {
+  await checkbox.check({ timeout: timeoutMs, force: true });
+}
+
+/**
  * Lance Chromium avec les args nécessaires en conteneur, avec vérification
  * de connexion + 1 retry. `--single-process`/`--no-zygote` ont été retirés :
  * ils sont connus pour crasher Chromium silencieusement peu après le launch
@@ -196,7 +214,7 @@ export async function reserve(dispoResidences, _nodes, opts = {}) {
     const aileNum = aileId.replace(`check_batiment_${resNum}_`, '');
     console.log(`[reserve] Aile trouvée : ${aileId}`);
 
-    await aileCheckbox.check({ timeout: 5000 });
+    await checkToggle(aileCheckbox);
     await page.waitForTimeout(800);
     await screenshot('F', `Aile cochée : Aile ${aileNum}`);
 
@@ -210,7 +228,7 @@ export async function reserve(dispoResidences, _nodes, opts = {}) {
     const cageIdx = cageId.replace(`check_cage_${resNum}_${aileNum}_`, '');
     console.log(`[reserve] Cage trouvée : ${cageId}`);
 
-    await cageCheckbox.check({ timeout: 5000 });
+    await checkToggle(cageCheckbox);
     await page.waitForTimeout(800);
     await screenshot('G', `Escalier coché : escalier ${cageIdx}`);
 
@@ -225,7 +243,7 @@ export async function reserve(dispoResidences, _nodes, opts = {}) {
     const chemin = `${target.label} › Aile ${aileNum} › Escalier ${cageIdx} › Niveau R+${nivNum}`;
     console.log(`[reserve] Niveau trouvé : ${niveauId}`);
 
-    await niveauCheckbox.check({ timeout: 5000 });
+    await checkToggle(niveauCheckbox);
 
     // Attendre le chargement AJAX du tableau "Logements disponibles"
     await page.waitForTimeout(2000);
