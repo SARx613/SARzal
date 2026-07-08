@@ -73,6 +73,55 @@ async function findFirstCheckbox(page, prefix, timeoutMs = 6000) {
 }
 
 /**
+ * Lit le tableau "Logements disponibles" (celui affiché juste avant de cliquer
+ * "Réserver", cf. étape H/I) et renvoie chaque ligne sous la forme
+ * { code, type, rowIndex }. On cherche la table par le TEXTE de ses en-têtes
+ * ("N° LOGEMENT", "TYPE LOGEMENT") plutôt qu'un id/class deviné, car cette
+ * table est injectée en AJAX et son markup exact n'a pas pu être vérifié
+ * hors-ligne (le HTML live du site n'était pas accessible au moment d'écrire
+ * ce code — cf. captures Telegram qui ont servi de référence).
+ */
+async function readLogementsDisponibles(page) {
+  // Le site affiche/masque ses sections via display:none ↔ display:block (JS)
+  // plutôt que de les ajouter/retirer du DOM (même pattern que #formulaire_voeu
+  // plus bas, déjà caché-puis-affiché). Plusieurs tables "LOGEMENT" peuvent donc
+  // coexister cachées dans le DOM : on ne garde que celle qui est VISIBLE
+  // (Playwright .isVisible() vérifie notamment display!=none) pour cibler la
+  // bonne, plutôt que de se fier seulement au texte.
+  const candidates = page.locator('table', { hasText: 'LOGEMENT' }).filter({ hasText: 'RÉSERVATION' });
+  const candidateCount = await candidates.count().catch(() => 0);
+  let first = null;
+  for (let i = 0; i < candidateCount; i++) {
+    const el = candidates.nth(i);
+    if (await el.isVisible().catch(() => false)) {
+      first = el;
+      break;
+    }
+  }
+  if (!first) return [];
+  const headers = await first.locator('th').allTextContents().catch(() => []);
+  const idxCode = headers.findIndex((h) => /N°\s*LOGEMENT/i.test(h));
+  const idxType = headers.findIndex((h) => /TYPE\s*LOGEMENT/i.test(h));
+  if (idxCode === -1) return [];
+
+  const rows = first.locator('tbody tr, tr').filter({ hasNot: page.locator('th') });
+  const rowCount = await rows.count().catch(() => 0);
+  const result = [];
+  for (let i = 0; i < rowCount; i++) {
+    const tds = await rows.nth(i).locator('td').allTextContents().catch(() => []);
+    if (!tds.length) continue;
+    const code = tds[idxCode]?.trim();
+    if (!code) continue;
+    result.push({
+      code,
+      type: idxType !== -1 ? tds[idxType]?.trim() || '' : '',
+      rowIndex: i,
+    });
+  }
+  return result;
+}
+
+/**
  * Coche une checkbox de type "toggle switch" (pattern CSS du site : l'input
  * est imbriqué dans un <label class="switch">...<span></span></label>, le
  * <span> dessinant visuellement le rond du switch par-dessus l'input réel).
@@ -253,33 +302,81 @@ export async function reserve(dispoResidences, _nodes, opts = {}) {
     // On a documenté toute la navigation jusqu'au tableau des logements, mais on
     // NE clique NI "Réserver" NI "Valider" : aucune réservation réelle n'est faite.
     if (!commit) {
+      const logementsDoc = await readLogementsDisponibles(page);
+      const { filterNewCodes, markSeen } = await import('./seen.js');
+      const newCodes = filterNewCodes(logementsDoc.map((l) => l.code));
+      if (logementsDoc.length > 0 && newCodes.length === 0) {
+        // Déjà notifié aujourd'hui pour ces codes précis → on n'embête pas
+        // Telegram une nouvelle fois.
+        return;
+      }
+      const codesLine = logementsDoc.length
+        ? logementsDoc.map((l) => `${l.code}${l.type ? ` (${l.type})` : ''}`).join(', ')
+        : '(code logement non lu)';
       await notify(
         `📸 <b>Captures terminées (pas de réservation)</b>\n\n` +
-        `📍 ${chemin}\n\n` +
+        `📍 ${chemin}\n` +
+        `🔑 Logement(s) : ${codesLine}\n\n` +
         `ℹ️ Cette résidence n'est pas III/IV → je n'ai rien réservé.\n` +
         `👉 Si tu veux la prendre, réserve à la main : ${URLS.reservation}`
       );
+      if (logementsDoc.length > 0) markSeen(logementsDoc.map((l) => l.code));
       return;
     }
 
+    // ── Étape H.5 : lire la liste des logements dispo (code + type) ──────────
+    // Table "Logements disponibles" avec colonnes RÉSERVATION ? / N° LOGEMENT /
+    // TYPE LOGEMENT (ex: 6CA306 / T1). Sert à 1) choisir un logement pas déjà
+    // notifié aujourd'hui (anti-doublon), 2) l'inclure dans la notif finale.
+    const logements = await readLogementsDisponibles(page);
+    console.log(`[reserve] Logements trouvés dans le tableau : ${JSON.stringify(logements)}`);
+
+    let chosen = logements[0] || null;
+    if (logements.length > 0) {
+      const { filterNewCodes } = await import('./seen.js');
+      const newCodes = filterNewCodes(logements.map((l) => l.code));
+      const notYetSeen = logements.filter((l) => newCodes.includes(l.code));
+      if (notYetSeen.length === 0) {
+        // Tous les logements de ce niveau ont déjà été notifiés aujourd'hui.
+        await notify(
+          `ℹ️ <b>${chemin}</b> : logement(s) ${logements.map((l) => l.code).join(', ')} déjà notifié(s) aujourd'hui → pas de nouvelle alerte, pas de re-réservation.`
+        );
+        return;
+      }
+      chosen = notYetSeen[0];
+    }
+
     // ── Étape I : cliquer "Réserver" dans le tableau ──────────────────────────
-    // On essaie plusieurs sélecteurs car le texte exact peut varier
-    const reserverSelectors = [
-      'button:has-text("Réserver")',
-      'a:has-text("Réserver")',
-      'input[value="Réserver"]',
-      'button:has-text("réserver")',
-      '[onclick*="reserver"]',
-      '[onclick*="Reserver"]',
-      '.btn:has-text("Réser")',
-    ];
+    // On cible la ligne du logement choisi (par son code) si on l'a identifié,
+    // sinon on retombe sur le premier bouton "Réserver" trouvé sur la page.
     let reserverBtn = null;
-    for (const sel of reserverSelectors) {
-      const el = page.locator(sel).first();
-      if (await el.isVisible({ timeout: 2000 }).catch(() => false)) {
-        reserverBtn = el;
-        console.log(`[reserve] Bouton Réserver trouvé avec : ${sel}`);
-        break;
+    if (chosen) {
+      const row = page.locator('tr', { hasText: chosen.code });
+      const rowBtn = row.locator(
+        'button:has-text("Réserver"), a:has-text("Réserver"), input[value="Réserver"], [onclick*="eserver"]'
+      ).first();
+      if (await rowBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
+        reserverBtn = rowBtn;
+      }
+    }
+    if (!reserverBtn) {
+      // On essaie plusieurs sélecteurs génériques car le texte exact peut varier
+      const reserverSelectors = [
+        'button:has-text("Réserver")',
+        'a:has-text("Réserver")',
+        'input[value="Réserver"]',
+        'button:has-text("réserver")',
+        '[onclick*="reserver"]',
+        '[onclick*="Reserver"]',
+        '.btn:has-text("Réser")',
+      ];
+      for (const sel of reserverSelectors) {
+        const el = page.locator(sel).first();
+        if (await el.isVisible({ timeout: 2000 }).catch(() => false)) {
+          reserverBtn = el;
+          console.log(`[reserve] Bouton Réserver trouvé avec : ${sel}`);
+          break;
+        }
       }
     }
 
@@ -299,25 +396,37 @@ export async function reserve(dispoResidences, _nodes, opts = {}) {
     await screenshot('J', 'Formulaire "Votre réservation de logement" — détails du logement');
 
     // Extraction des caractéristiques du logement affichées dans le tableau
-    // "Votre réservation de logement" (#tr_formulaire_voeu). Les <td> n'ont pas
-    // d'id individuel : on les récupère par position, dans l'ordre des <th>
-    // (Type logement / Colocation / Nbr occupants / PMR / Surface / Balcon /
-    // Boursier prioritaire / Loyer charges comprises / Dépôt garantie / Frais
-    // de dossier).
-    const logementInfo = await page.locator('#tr_formulaire_voeu td').allTextContents()
-      .then((tds) => ({
-        typeLogement: tds[0]?.trim() || '',
-        colocation: tds[1]?.trim() || '',
-        nbOccupants: tds[2]?.trim() || '',
-        pmr: tds[3]?.trim() || '',
-        surface: tds[4]?.trim() || '',
-        balcon: tds[5]?.trim() || '',
-        boursier: tds[6]?.trim() || '',
-        loyer: tds[7]?.trim() || '',
-        depotGarantie: tds[8]?.trim() || '',
-        fraisDossier: tds[9]?.trim() || '',
-      }))
-      .catch(() => null);
+    // "Votre réservation de logement". On lit les <th> pour retrouver l'index
+    // réel de chaque colonne au lieu de suppposer un ordre fixe : les captures
+    // Telegram ont montré un décalage (une colonne "N° logement" en position 0
+    // fait glisser toutes les colonnes suivantes d'un cran par rapport à
+    // l'hypothèse initiale "Type/Colocation/Nbr occupants/...").
+    const logementInfo = await (async () => {
+      const table = page.locator('table', { hasText: 'LOGEMENT' }).filter({ hasText: 'COLOCATION' });
+      const headers = await table.first().locator('th').allTextContents().catch(() => []);
+      const tds = await page.locator('#tr_formulaire_voeu td').allTextContents().catch(() => []);
+      if (!headers.length || !tds.length) return null;
+
+      const idx = (re) => headers.findIndex((h) => re.test(h));
+      const at = (i) => (i !== -1 ? tds[i]?.trim() || '' : '');
+      return {
+        code: at(idx(/N°\s*LOGEMENT/i)),
+        typeLogement: at(idx(/TYPE\s*LOGEMENT/i)),
+        colocation: at(idx(/COLOCATION/i)),
+        nbOccupants: at(idx(/OCCUPANTS/i)),
+        pmr: at(idx(/PMR/i)),
+        surface: at(idx(/SURFACE/i)),
+        balcon: at(idx(/BALCON/i)),
+        boursier: at(idx(/BOURSIER/i)),
+        loyer: at(idx(/LOYER/i)),
+        depotGarantie: at(idx(/D[ÉE]P[ÔO]T/i)),
+        fraisDossier: at(idx(/FRAIS/i)),
+      };
+    })().catch(() => null);
+
+    // Repli : si le code n'a pas pu être lu dans le formulaire de confirmation,
+    // on garde celui identifié plus tôt dans le tableau "Logements disponibles".
+    if (logementInfo && !logementInfo.code && chosen) logementInfo.code = chosen.code;
 
     // Cliquer "Valider votre réservation" (appelle submit_reservation() en JS)
     const validerBtn = page.locator(
@@ -331,6 +440,7 @@ export async function reserve(dispoResidences, _nodes, opts = {}) {
 
     const detailsLines = logementInfo
       ? [
+          `🔑 N° logement : ${logementInfo.code || chosen?.code || '?'}`,
           `🏷️ Type : ${logementInfo.typeLogement}`,
           `👥 Colocation : ${logementInfo.colocation}`,
           `🔢 Nbr occupants : ${logementInfo.nbOccupants}`,
@@ -340,6 +450,13 @@ export async function reserve(dispoResidences, _nodes, opts = {}) {
           `📄 Frais de dossier : ${logementInfo.fraisDossier}`,
         ].join('\n')
       : '⚠️ Détails du logement non récupérés (structure de page inattendue).';
+
+    // Anti-doublon : ce logement (et les autres du même niveau) ne seront plus
+    // re-notifiés aujourd'hui.
+    if (logements.length > 0) {
+      const { markSeen } = await import('./seen.js');
+      markSeen(logements.map((l) => l.code));
+    }
 
     await notify(
       `✅ <b>Réservation tentée !</b>\n\n` +
