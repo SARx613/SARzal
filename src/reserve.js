@@ -430,33 +430,48 @@ export async function reserve(dispoResidences, _nodes, opts = {}) {
     await screenshot('J', 'Formulaire "Votre réservation de logement" — détails du logement');
 
     // Extraction des caractéristiques du logement affichées dans le tableau
-    // "Votre réservation de logement" (#formulaire_voeu). Structure vérifiée
-    // en LIVE sur le HTML réel du site (2026-07-08, via fetch avec la session
-    // active) : ce tableau a exactement 10 colonnes, dans cet ordre fixe —
-    // Type logement / Colocation ? / Nbr occupants logement / Personne à
-    // mobilité restreinte ? / Surface logement / Balcon ? / Boursier
-    // prioritaire ? / Loyer charges comprises / Dépôt Garantie / Frais de
-    // dossier. PAS de colonne "N° logement" dans CE tableau — le code
-    // logement (ex: 6CA306) ne vient que du tableau "Logements disponibles"
-    // (cf. readLogementsDisponibles / `chosen` plus haut).
-    const logementInfo = await page.locator('#tr_formulaire_voeu td').allTextContents()
-      .then((tds) => ({
-        typeLogement: tds[0]?.trim() || '',
-        colocation: tds[1]?.trim() || '',
-        nbOccupants: tds[2]?.trim() || '',
-        pmr: tds[3]?.trim() || '',
-        surface: tds[4]?.trim() || '',
-        balcon: tds[5]?.trim() || '',
-        boursier: tds[6]?.trim() || '',
-        loyer: tds[7]?.trim() || '',
-        depotGarantie: tds[8]?.trim() || '',
-        fraisDossier: tds[9]?.trim() || '',
-      }))
-      .catch(() => null);
+    // "Votre réservation de logement" (#formulaire_voeu). Sur le HTML statique
+    // (sans logement dispo) ce tableau a 10 <th> fixes (Type/Colocation/Nbr
+    // occupants/PMR/Surface/Balcon/Boursier/Loyer/Dépôt/Frais), sans colonne
+    // "N° logement". MAIS une capture Telegram d'un vrai cas (logement 6CA306
+    // réellement dispo) montre le code logement affiché dans CE tableau — le
+    // bouton "Réserver" du tableau précédent injecte donc probablement une
+    // colonne supplémentaire en tête (ou remplit un <td> non visible dans le
+    // template vide). On lit les <th> RÉELS au moment de l'exécution (au lieu
+    // de supposer 10 colonnes fixes) pour s'adapter aux deux cas sans risquer
+    // un décalage silencieux entre libellé et valeur.
+    const logementInfo = await (async () => {
+      const headers = await page.locator('#formulaire_voeu thead th').allTextContents().catch(() => []);
+      const tds = await page.locator('#tr_formulaire_voeu td').allTextContents().catch(() => []);
+      if (!tds.length) return null;
 
-    // Le code logement (ex: 6CA306) vient du tableau "Logements disponibles"
-    // lu plus haut (`chosen`), pas de ce formulaire qui n'a pas cette colonne.
-    if (logementInfo) logementInfo.code = chosen?.code || '';
+      const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+      const idx = (re) => headers.findIndex((h) => re.test(norm(h)));
+      const at = (i) => (i !== -1 && i < tds.length ? tds[i]?.trim() || '' : '');
+
+      // Repli sur position fixe si un <th> attendu est introuvable (ex: si le
+      // nombre de colonnes correspond bien au template à 10 vu hors-ligne).
+      const hasExtraCodeCol = headers.some((h) => /N°\s*logement/i.test(h)) || tds.length > headers.length;
+      const offset = hasExtraCodeCol ? 1 : 0;
+
+      return {
+        code: at(idx(/N°\s*logement/i)) || (hasExtraCodeCol ? at(0) : ''),
+        typeLogement: at(idx(/Type\s*logement/i)) || at(0 + offset),
+        colocation: at(idx(/Colocation/i)) || at(1 + offset),
+        nbOccupants: at(idx(/occupants/i)) || at(2 + offset),
+        pmr: at(idx(/mobilité restreinte/i)) || at(3 + offset),
+        surface: at(idx(/Surface/i)) || at(4 + offset),
+        balcon: at(idx(/Balcon/i)) || at(5 + offset),
+        boursier: at(idx(/Boursier/i)) || at(6 + offset),
+        loyer: at(idx(/Loyer/i)) || at(7 + offset),
+        depotGarantie: at(idx(/Dépôt/i)) || at(8 + offset),
+        fraisDossier: at(idx(/Frais de dossier/i)) || at(9 + offset),
+      };
+    })().catch(() => null);
+
+    // Repli final : si le code n'a toujours pas été lu dans ce formulaire, on
+    // garde celui identifié plus tôt dans le tableau "Logements disponibles".
+    if (logementInfo && !logementInfo.code && chosen) logementInfo.code = chosen.code;
 
     // Cliquer "Valider votre réservation" (appelle submit_reservation() en JS)
     const validerBtn = page.locator(
