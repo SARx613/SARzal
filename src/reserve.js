@@ -430,47 +430,47 @@ export async function reserve(dispoResidences, _nodes, opts = {}) {
     await screenshot('J', 'Formulaire "Votre réservation de logement" — détails du logement');
 
     // Extraction des caractéristiques du logement affichées dans le tableau
-    // "Votre réservation de logement" (#formulaire_voeu). Sur le HTML statique
-    // (sans logement dispo) ce tableau a 10 <th> fixes (Type/Colocation/Nbr
-    // occupants/PMR/Surface/Balcon/Boursier/Loyer/Dépôt/Frais), sans colonne
-    // "N° logement". MAIS une capture Telegram d'un vrai cas (logement 6CA306
-    // réellement dispo) montre le code logement affiché dans CE tableau — le
-    // bouton "Réserver" du tableau précédent injecte donc probablement une
-    // colonne supplémentaire en tête (ou remplit un <td> non visible dans le
-    // template vide). On lit les <th> RÉELS au moment de l'exécution (au lieu
-    // de supposer 10 colonnes fixes) pour s'adapter aux deux cas sans risquer
-    // un décalage silencieux entre libellé et valeur.
+    // "Votre réservation de logement" (#formulaire_voeu).
+    //
+    // ⚠️ CONFIRMÉ par capture Telegram d'un vrai cas (logement 6CA306) : ce
+    // tableau a bien 10 <th> ET 10 <td> (nombre de colonnes égal — pas de
+    // colonne en trop), MAIS les valeurs sont décalées d'UNE POSITION vers la
+    // gauche par rapport à leurs propres en-têtes : tds[0] ("sous" l'en-tête
+    // "Type logement") contient en fait le CODE logement (6CA306), tds[1]
+    // ("sous" "Colocation ?") contient le vrai TYPE (T1), tds[2] ("sous" "Nbr
+    // occupants") contient la vraie colocation (Non), etc. C'est un bug
+    // d'alignement du site lui-même (probablement une colonne "N° logement"
+    // existe dans les données mais son <th> a été supprimé du template),
+    // pas un problème de lecture. La dernière valeur logique (Frais de
+    // dossier) sort donc du tableau (il n'y a plus de td pour elle).
+    //
+    // On lit donc par décalage fixe de +1, avec repli sur les libellés de
+    // <th> réels seulement si jamais le nombre de td dépasse celui des th
+    // (auquel cas la table aurait vraiment une colonne en plus et le décalage
+    // serait ailleurs).
     const logementInfo = await (async () => {
-      const headers = await page.locator('#formulaire_voeu thead th').allTextContents().catch(() => []);
       const tds = await page.locator('#tr_formulaire_voeu td').allTextContents().catch(() => []);
       if (!tds.length) return null;
-
-      const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
-      const idx = (re) => headers.findIndex((h) => re.test(norm(h)));
-      const at = (i) => (i !== -1 && i < tds.length ? tds[i]?.trim() || '' : '');
-
-      // Repli sur position fixe si un <th> attendu est introuvable (ex: si le
-      // nombre de colonnes correspond bien au template à 10 vu hors-ligne).
-      const hasExtraCodeCol = headers.some((h) => /N°\s*logement/i.test(h)) || tds.length > headers.length;
-      const offset = hasExtraCodeCol ? 1 : 0;
+      const at = (i) => tds[i]?.trim() || '';
 
       return {
-        code: at(idx(/N°\s*logement/i)) || (hasExtraCodeCol ? at(0) : ''),
-        typeLogement: at(idx(/Type\s*logement/i)) || at(0 + offset),
-        colocation: at(idx(/Colocation/i)) || at(1 + offset),
-        nbOccupants: at(idx(/occupants/i)) || at(2 + offset),
-        pmr: at(idx(/mobilité restreinte/i)) || at(3 + offset),
-        surface: at(idx(/Surface/i)) || at(4 + offset),
-        balcon: at(idx(/Balcon/i)) || at(5 + offset),
-        boursier: at(idx(/Boursier/i)) || at(6 + offset),
-        loyer: at(idx(/Loyer/i)) || at(7 + offset),
-        depotGarantie: at(idx(/Dépôt/i)) || at(8 + offset),
-        fraisDossier: at(idx(/Frais de dossier/i)) || at(9 + offset),
+        code: at(0),
+        typeLogement: at(1),
+        colocation: at(2),
+        nbOccupants: at(3),
+        pmr: at(4),
+        surface: at(5),
+        balcon: at(6),
+        boursier: at(7),
+        loyer: at(8),
+        depotGarantie: at(9),
+        fraisDossier: '', // perdu : décalage de +1 fait sortir cette valeur du tableau
       };
     })().catch(() => null);
 
-    // Repli final : si le code n'a toujours pas été lu dans ce formulaire, on
-    // garde celui identifié plus tôt dans le tableau "Logements disponibles".
+    // Repli : si le code lu ici est vide (tableau finalement pas décalé, ou
+    // structure différente), on garde celui identifié plus tôt dans le
+    // tableau "Logements disponibles".
     if (logementInfo && !logementInfo.code && chosen) logementInfo.code = chosen.code;
 
     // Cliquer "Valider votre réservation" (appelle submit_reservation() en JS)
