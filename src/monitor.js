@@ -253,20 +253,26 @@ export async function checkOnce() {
       // La réservation (Playwright) est protégée par un TIMEOUT GLOBAL DUR : si
       // elle se bloque (ex. Chromium qui gèle), on abandonne au bout de 3 min et
       // on RENDS LA MAIN à la surveillance — elle ne doit jamais mourir en silence.
+      // On traite chaque résidence cible SÉPARÉMENT (un appel reserve() par
+      // résidence, donc un navigateur par résidence) : si III et IV sont dispo
+      // en même temps, on ne veut pas ignorer l'une des deux pour ne traiter
+      // que la première du tableau.
       const RESERVE_TIMEOUT_MS = 3 * 60_000;
-      try {
-        const { reserve } = await import('./reserve.js');
-        await Promise.race([
-          reserve(targetResidences, nodes, { commit: isEligible }),
-          new Promise((_, rej) =>
-            setTimeout(() => rej(new Error('RESERVE_TIMEOUT (>3min, abandon)')), RESERVE_TIMEOUT_MS)
-          ),
-        ]);
-      } catch (err) {
-        await notify(
-          `⚠️ ${isEligible ? 'Réservation auto' : 'Captures'} en échec : <code>${escapeHtml(err.message)}</code>\n` +
-          `👉 Réserve à la main si besoin : ${URLS.reservation}`
-        );
+      const { reserve } = await import('./reserve.js');
+      for (const res of targetResidences) {
+        try {
+          await Promise.race([
+            reserve([res], nodes, { commit: isEligible }),
+            new Promise((_, rej) =>
+              setTimeout(() => rej(new Error('RESERVE_TIMEOUT (>3min, abandon)')), RESERVE_TIMEOUT_MS)
+            ),
+          ]);
+        } catch (err) {
+          await notify(
+            `⚠️ ${isEligible ? 'Réservation auto' : 'Captures'} (${res.label}) en échec : <code>${escapeHtml(err.message)}</code>\n` +
+            `👉 Réserve à la main si besoin : ${URLS.reservation}`
+          );
+        }
       }
     }
     return { available: true, autoReserved: isEligible, nodes };
