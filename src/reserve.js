@@ -76,10 +76,18 @@ async function findFirstCheckbox(page, prefix, timeoutMs = 6000) {
  * Lit le tableau "Logements disponibles" (celui affiché juste avant de cliquer
  * "Réserver", cf. étape H/I) et renvoie chaque ligne sous la forme
  * { code, type, rowIndex }. On cherche la table par le TEXTE de ses en-têtes
- * ("N° LOGEMENT", "TYPE LOGEMENT") plutôt qu'un id/class deviné, car cette
- * table est injectée en AJAX et son markup exact n'a pas pu être vérifié
- * hors-ligne (le HTML live du site n'était pas accessible au moment d'écrire
- * ce code — cf. captures Telegram qui ont servi de référence).
+ * ("N° LOGEMENT", "TYPE LOGEMENT") plutôt qu'un id/class deviné.
+ *
+ * ⚠️ Vérifié en live le 2026-07-08 (fetch avec la session active) : le site
+ * génère ce tableau UNIQUEMENT côté PHP quand un logement existe réellement à
+ * cet étage (sinon le <div id="niveau_..._logements"> ne contient qu'un <h4>
+ * "Aucun logement n'est disponible..."). Comme aucun logement n'était dispo au
+ * moment du test, le markup exact de CE tableau précis (classes CSS, nom de
+ * colonnes) n'a pas pu être confirmé sur le HTML réel — seules les captures
+ * Telegram (colonnes RÉSERVATION ? / N° LOGEMENT / TYPE LOGEMENT) servent de
+ * référence ici. Si cette fonction ne trouve rien à la prochaine dispo réelle,
+ * dumpDebugHtml() ci-dessous aura sauvegardé + envoyé le HTML exact pour
+ * ajuster les sélecteurs rapidement.
  */
 async function readLogementsDisponibles(page) {
   // Le site affiche/masque ses sections via display:none ↔ display:block (JS)
@@ -98,11 +106,17 @@ async function readLogementsDisponibles(page) {
       break;
     }
   }
-  if (!first) return [];
+  if (!first) {
+    await dumpDebugHtml(page, 'logements_table_introuvable');
+    return [];
+  }
   const headers = await first.locator('th').allTextContents().catch(() => []);
   const idxCode = headers.findIndex((h) => /N°\s*LOGEMENT/i.test(h));
   const idxType = headers.findIndex((h) => /TYPE\s*LOGEMENT/i.test(h));
-  if (idxCode === -1) return [];
+  if (idxCode === -1) {
+    await dumpDebugHtml(page, 'colonne_code_logement_introuvable');
+    return [];
+  }
 
   const rows = first.locator('tbody tr, tr').filter({ hasNot: page.locator('th') });
   const rowCount = await rows.count().catch(() => 0);
@@ -119,6 +133,26 @@ async function readLogementsDisponibles(page) {
     });
   }
   return result;
+}
+
+/**
+ * Filet de sécurité : si la lecture du tableau "Logements disponibles" échoue
+ * (structure différente de ce qui était prévu), on sauvegarde le HTML complet
+ * de la page + on l'envoie sur Telegram en pièce jointe, pour pouvoir ajuster
+ * les sélecteurs dès le premier cas réel au lieu de rester aveugle.
+ */
+async function dumpDebugHtml(page, tag) {
+  try {
+    const html = await page.content();
+    const { writeFileSync } = await import('fs');
+    const p = new URL(`../config/reserve_debug_${tag}.html`, import.meta.url).pathname;
+    writeFileSync(p, html);
+    await notify(
+      `🐛 <b>Debug</b> : structure inattendue pour "${tag}". HTML sauvegardé sur le serveur : <code>config/reserve_debug_${tag}.html</code>`
+    );
+  } catch (e) {
+    console.warn('[reserve] dumpDebugHtml échoué:', e.message);
+  }
 }
 
 /**
@@ -396,37 +430,33 @@ export async function reserve(dispoResidences, _nodes, opts = {}) {
     await screenshot('J', 'Formulaire "Votre réservation de logement" — détails du logement');
 
     // Extraction des caractéristiques du logement affichées dans le tableau
-    // "Votre réservation de logement". On lit les <th> pour retrouver l'index
-    // réel de chaque colonne au lieu de suppposer un ordre fixe : les captures
-    // Telegram ont montré un décalage (une colonne "N° logement" en position 0
-    // fait glisser toutes les colonnes suivantes d'un cran par rapport à
-    // l'hypothèse initiale "Type/Colocation/Nbr occupants/...").
-    const logementInfo = await (async () => {
-      const table = page.locator('table', { hasText: 'LOGEMENT' }).filter({ hasText: 'COLOCATION' });
-      const headers = await table.first().locator('th').allTextContents().catch(() => []);
-      const tds = await page.locator('#tr_formulaire_voeu td').allTextContents().catch(() => []);
-      if (!headers.length || !tds.length) return null;
+    // "Votre réservation de logement" (#formulaire_voeu). Structure vérifiée
+    // en LIVE sur le HTML réel du site (2026-07-08, via fetch avec la session
+    // active) : ce tableau a exactement 10 colonnes, dans cet ordre fixe —
+    // Type logement / Colocation ? / Nbr occupants logement / Personne à
+    // mobilité restreinte ? / Surface logement / Balcon ? / Boursier
+    // prioritaire ? / Loyer charges comprises / Dépôt Garantie / Frais de
+    // dossier. PAS de colonne "N° logement" dans CE tableau — le code
+    // logement (ex: 6CA306) ne vient que du tableau "Logements disponibles"
+    // (cf. readLogementsDisponibles / `chosen` plus haut).
+    const logementInfo = await page.locator('#tr_formulaire_voeu td').allTextContents()
+      .then((tds) => ({
+        typeLogement: tds[0]?.trim() || '',
+        colocation: tds[1]?.trim() || '',
+        nbOccupants: tds[2]?.trim() || '',
+        pmr: tds[3]?.trim() || '',
+        surface: tds[4]?.trim() || '',
+        balcon: tds[5]?.trim() || '',
+        boursier: tds[6]?.trim() || '',
+        loyer: tds[7]?.trim() || '',
+        depotGarantie: tds[8]?.trim() || '',
+        fraisDossier: tds[9]?.trim() || '',
+      }))
+      .catch(() => null);
 
-      const idx = (re) => headers.findIndex((h) => re.test(h));
-      const at = (i) => (i !== -1 ? tds[i]?.trim() || '' : '');
-      return {
-        code: at(idx(/N°\s*LOGEMENT/i)),
-        typeLogement: at(idx(/TYPE\s*LOGEMENT/i)),
-        colocation: at(idx(/COLOCATION/i)),
-        nbOccupants: at(idx(/OCCUPANTS/i)),
-        pmr: at(idx(/PMR/i)),
-        surface: at(idx(/SURFACE/i)),
-        balcon: at(idx(/BALCON/i)),
-        boursier: at(idx(/BOURSIER/i)),
-        loyer: at(idx(/LOYER/i)),
-        depotGarantie: at(idx(/D[ÉE]P[ÔO]T/i)),
-        fraisDossier: at(idx(/FRAIS/i)),
-      };
-    })().catch(() => null);
-
-    // Repli : si le code n'a pas pu être lu dans le formulaire de confirmation,
-    // on garde celui identifié plus tôt dans le tableau "Logements disponibles".
-    if (logementInfo && !logementInfo.code && chosen) logementInfo.code = chosen.code;
+    // Le code logement (ex: 6CA306) vient du tableau "Logements disponibles"
+    // lu plus haut (`chosen`), pas de ce formulaire qui n'a pas cette colonne.
+    if (logementInfo) logementInfo.code = chosen?.code || '';
 
     // Cliquer "Valider votre réservation" (appelle submit_reservation() en JS)
     const validerBtn = page.locator(
