@@ -332,32 +332,6 @@ export async function reserve(dispoResidences, _nodes, opts = {}) {
     await page.waitForTimeout(2000);
     await screenshot('H', `Niveau coché : ${chemin}\nTableau "Logements disponibles" attendu`);
 
-    // ── Mode "captures seulement" (résidences hors III/IV) ────────────────────
-    // On a documenté toute la navigation jusqu'au tableau des logements, mais on
-    // NE clique NI "Réserver" NI "Valider" : aucune réservation réelle n'est faite.
-    if (!commit) {
-      const logementsDoc = await readLogementsDisponibles(page);
-      const { filterNewCodes, markSeen } = await import('./seen.js');
-      const newCodes = filterNewCodes(logementsDoc.map((l) => l.code));
-      if (logementsDoc.length > 0 && newCodes.length === 0) {
-        // Déjà notifié aujourd'hui pour ces codes précis → on n'embête pas
-        // Telegram une nouvelle fois.
-        return;
-      }
-      const codesLine = logementsDoc.length
-        ? logementsDoc.map((l) => `${l.code}${l.type ? ` (${l.type})` : ''}`).join(', ')
-        : '(code logement non lu)';
-      await notify(
-        `📸 <b>Captures terminées (pas de réservation)</b>\n\n` +
-        `📍 ${chemin}\n` +
-        `🔑 Logement(s) : ${codesLine}\n\n` +
-        `ℹ️ Cette résidence n'est pas III/IV → je n'ai rien réservé.\n` +
-        `👉 Si tu veux la prendre, réserve à la main : ${URLS.reservation}`
-      );
-      if (logementsDoc.length > 0) markSeen(logementsDoc.map((l) => l.code));
-      return;
-    }
-
     // ── Étape H.5 : lire la liste des logements dispo (code + type) ──────────
     // Table "Logements disponibles" avec colonnes RÉSERVATION ? / N° LOGEMENT /
     // TYPE LOGEMENT (ex: 6CA306 / T1). Sert à 1) choisir un logement pas déjà
@@ -373,7 +347,7 @@ export async function reserve(dispoResidences, _nodes, opts = {}) {
       if (notYetSeen.length === 0) {
         // Tous les logements de ce niveau ont déjà été notifiés aujourd'hui.
         await notify(
-          `ℹ️ <b>${chemin}</b> : logement(s) ${logements.map((l) => l.code).join(', ')} déjà notifié(s) aujourd'hui → pas de nouvelle alerte, pas de re-réservation.`
+          `ℹ️ <b>${chemin}</b> : logement(s) ${logements.map((l) => l.code).join(', ')} déjà notifié(s) aujourd'hui → pas de nouvelle alerte${commit ? ', pas de re-réservation' : ''}.`
         );
         return;
       }
@@ -473,16 +447,6 @@ export async function reserve(dispoResidences, _nodes, opts = {}) {
     // tableau "Logements disponibles".
     if (logementInfo && !logementInfo.code && chosen) logementInfo.code = chosen.code;
 
-    // Cliquer "Valider votre réservation" (appelle submit_reservation() en JS)
-    const validerBtn = page.locator(
-      'button:has-text("Valider votre réservation"), [onclick*="submit_reservation"]'
-    ).first();
-    await validerBtn.waitFor({ state: 'visible', timeout: 5000 });
-    await validerBtn.click();
-
-    await page.waitForTimeout(2000);
-    await screenshot('K', 'Après "Valider votre réservation" — résultat final');
-
     const detailsLines = logementInfo
       ? [
           `🔑 N° logement : ${logementInfo.code || chosen?.code || '?'}`,
@@ -497,11 +461,35 @@ export async function reserve(dispoResidences, _nodes, opts = {}) {
       : '⚠️ Détails du logement non récupérés (structure de page inattendue).';
 
     // Anti-doublon : ce logement (et les autres du même niveau) ne seront plus
-    // re-notifiés aujourd'hui.
+    // re-notifiés aujourd'hui, qu'on réserve ou non.
     if (logements.length > 0) {
       const { markSeen } = await import('./seen.js');
       markSeen(logements.map((l) => l.code));
     }
+
+    // ── Mode "captures + détails" (résidences hors III/IV) ───────────────────
+    // On a lu toutes les infos du formulaire de confirmation, mais on NE clique
+    // PAS "Valider votre réservation" : aucune réservation réelle n'est faite.
+    if (!commit) {
+      await notify(
+        `📸 <b>Logement détaillé (pas de réservation)</b>\n\n` +
+        `📍 ${chemin}\n\n` +
+        `${detailsLines}\n\n` +
+        `ℹ️ Cette résidence n'est pas III/IV → je n'ai rien réservé.\n` +
+        `👉 Si tu veux la prendre, réserve à la main : ${URLS.reservation}`
+      );
+      return;
+    }
+
+    // Cliquer "Valider votre réservation" (appelle submit_reservation() en JS)
+    const validerBtn = page.locator(
+      'button:has-text("Valider votre réservation"), [onclick*="submit_reservation"]'
+    ).first();
+    await validerBtn.waitFor({ state: 'visible', timeout: 5000 });
+    await validerBtn.click();
+
+    await page.waitForTimeout(2000);
+    await screenshot('K', 'Après "Valider votre réservation" — résultat final');
 
     await notify(
       `✅ <b>Réservation tentée !</b>\n\n` +
