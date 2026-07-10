@@ -1,6 +1,6 @@
 import { chromium } from 'playwright';
 import { config, URLS, STORAGE_STATE } from './config.js';
-import { notify, notifyPhoto, escapeHtml } from './notify.js';
+import { notify, notifyPhoto, notifyDocument, escapeHtml } from './notify.js';
 
 /**
  * RÉSERVATION AUTOMATIQUE (mode reserve)
@@ -242,6 +242,29 @@ export async function reserve(dispoResidences, _nodes, opts = {}) {
     }
   };
 
+  /**
+   * Sauvegarde le HTML complet de la page sur le serveur (config/) pour une
+   * étape donnée. Contrairement au screenshot (qui montre le rendu visuel),
+   * le HTML donne directement les vrais id/class/structure — c'est ce qui a
+   * permis de corriger le bug du datepicker et des toggles aile/cage/niveau.
+   * Appelé systématiquement aux étapes critiques encore jamais vérifiées sur
+   * un vrai logement dispo (clic "Réserver", formulaire J, après "Valider"),
+   * pas seulement en cas d'erreur, pour pouvoir diagnostiquer immédiatement
+   * si un sélecteur ne matche plus au premier vrai cas III/IV.
+   */
+  const dumpHtml = async (stepName) => {
+    try {
+      const html = await page.content();
+      const { writeFileSync } = await import('fs');
+      const filename = `reserve_step_${stepName}.html`;
+      const p = new URL(`../config/${filename}`, import.meta.url).pathname;
+      writeFileSync(p, html);
+      await notifyDocument(`🧾 HTML étape ${stepName}`, Buffer.from(html, 'utf8'), filename);
+    } catch (e) {
+      console.warn(`[reserve] Dump HTML ${stepName} échoué:`, e.message);
+    }
+  };
+
   try {
     // ── Étape A : page de réservation ────────────────────────────────────────
     await page.goto(URLS.reservation, { waitUntil: 'domcontentloaded' });
@@ -394,14 +417,17 @@ export async function reserve(dispoResidences, _nodes, opts = {}) {
     }
 
     await screenshot('I', 'Tableau "Logements disponibles" — bouton Réserver trouvé');
+    await dumpHtml('I');
     await reserverBtn.click();
     await page.waitForTimeout(1500);
     await screenshot('I2', 'Après clic Réserver — formulaire de confirmation attendu');
+    await dumpHtml('I2');
 
     // ── Étape J : formulaire de confirmation #formulaire_voeu ─────────────────
     // Attendre que le formulaire de confirmation soit visible
     await page.locator('#formulaire_voeu').waitFor({ state: 'visible', timeout: 10000 });
     await screenshot('J', 'Formulaire "Votre réservation de logement" — détails du logement');
+    await dumpHtml('J');
 
     // Extraction des caractéristiques du logement affichées dans le tableau
     // "Votre réservation de logement" (#formulaire_voeu).
@@ -490,6 +516,7 @@ export async function reserve(dispoResidences, _nodes, opts = {}) {
 
     await page.waitForTimeout(2000);
     await screenshot('K', 'Après "Valider votre réservation" — résultat final');
+    await dumpHtml('K');
 
     await notify(
       `✅ <b>Réservation tentée !</b>\n\n` +
