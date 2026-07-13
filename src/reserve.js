@@ -73,66 +73,80 @@ async function findFirstCheckbox(page, prefix, timeoutMs = 6000) {
 }
 
 /**
- * Lit le tableau "Logements disponibles" (celui affiché juste avant de cliquer
- * "Réserver", cf. étape H/I) et renvoie chaque ligne sous la forme
- * { code, type, rowIndex }. On cherche la table par le TEXTE de ses en-têtes
- * ("N° LOGEMENT", "TYPE LOGEMENT") plutôt qu'un id/class deviné.
+ * Lit le tableau "Logements disponibles" affiché après avoir coché le niveau,
+ * et renvoie pour CHAQUE logement toutes ses caractéristiques + l'id de sa
+ * checkbox de réservation. Tout est là, pas besoin d'aller plus loin.
  *
- * ⚠️ Vérifié en live le 2026-07-08 (fetch avec la session active) : le site
- * génère ce tableau UNIQUEMENT côté PHP quand un logement existe réellement à
- * cet étage (sinon le <div id="niveau_..._logements"> ne contient qu'un <h4>
- * "Aucun logement n'est disponible..."). Comme aucun logement n'était dispo au
- * moment du test, le markup exact de CE tableau précis (classes CSS, nom de
- * colonnes) n'a pas pu être confirmé sur le HTML réel — seules les captures
- * Telegram (colonnes RÉSERVATION ? / N° LOGEMENT / TYPE LOGEMENT) servent de
- * référence ici. Si cette fonction ne trouve rien à la prochaine dispo réelle,
- * dumpDebugHtml() ci-dessous aura sauvegardé + envoyé le HTML exact pour
- * ajuster les sélecteurs rapidement.
+ * ✅ Structure CONFIRMÉE sur le HTML réel (logement 1B318, capturé le 12/07) :
+ * chaque logement est une ligne <tr id="tr_logement_XXX"> avec, dans l'ordre :
+ *   td[0] = <input id="check_logement_XXX"> (la colonne "Réservation ?")
+ *   td[1] = N° logement       (ex. 1B318)
+ *   td[2] = Type              (ex. T2)
+ *   td[3] = Colocation ?      (Oui/Non + éventuellement "Loyer solidaire")
+ *   td[4] = Nbr occupants
+ *   td[5] = PMR ?
+ *   td[6] = Surface           (ex. 28,00 m²)
+ *   td[7] = Balcon ?
+ *   td[8] = Boursier prioritaire ?
+ *   td[9] = Loyer charges comprises  (ex. 367,97 €)
+ *   td[10] = Dépôt garantie
+ *   td[11] = Frais de dossier
+ *
+ * ⚠️ Il n'y a AUCUN bouton "Réserver" : pour réserver on coche le toggle
+ * #check_logement_XXX, ce qui déclenche le JS qui affiche #formulaire_voeu.
  */
 async function readLogementsDisponibles(page) {
-  // Le site affiche/masque ses sections via display:none ↔ display:block (JS)
-  // plutôt que de les ajouter/retirer du DOM (même pattern que #formulaire_voeu
-  // plus bas, déjà caché-puis-affiché). Plusieurs tables "LOGEMENT" peuvent donc
-  // coexister cachées dans le DOM : on ne garde que celle qui est VISIBLE
-  // (Playwright .isVisible() vérifie notamment display!=none) pour cibler la
-  // bonne, plutôt que de se fier seulement au texte.
-  const candidates = page.locator('table', { hasText: 'LOGEMENT' }).filter({ hasText: 'RÉSERVATION' });
-  const candidateCount = await candidates.count().catch(() => 0);
-  let first = null;
-  for (let i = 0; i < candidateCount; i++) {
-    const el = candidates.nth(i);
-    if (await el.isVisible().catch(() => false)) {
-      first = el;
-      break;
-    }
-  }
-  if (!first) {
-    await dumpDebugHtml(page, 'logements_table_introuvable');
-    return [];
-  }
-  const headers = await first.locator('th').allTextContents().catch(() => []);
-  const idxCode = headers.findIndex((h) => /N°\s*LOGEMENT/i.test(h));
-  const idxType = headers.findIndex((h) => /TYPE\s*LOGEMENT/i.test(h));
-  if (idxCode === -1) {
-    await dumpDebugHtml(page, 'colonne_code_logement_introuvable');
-    return [];
-  }
-
-  const rows = first.locator('tbody tr, tr').filter({ hasNot: page.locator('th') });
+  // Les lignes de logement portent toutes un id "tr_logement_XXX" et sont
+  // injectées côté PHP uniquement quand un logement existe réellement. On ne
+  // garde que celles réellement visibles (le site a plein de tables cachées en
+  // display:none dans le DOM).
+  const rows = page.locator('tr[id^="tr_logement_"]');
   const rowCount = await rows.count().catch(() => 0);
   const result = [];
   for (let i = 0; i < rowCount; i++) {
-    const tds = await rows.nth(i).locator('td').allTextContents().catch(() => []);
-    if (!tds.length) continue;
-    const code = tds[idxCode]?.trim();
-    if (!code) continue;
+    const row = rows.nth(i);
+    if (!(await row.isVisible().catch(() => false))) continue;
+
+    const id = await row.getAttribute('id'); // "tr_logement_1B318"
+    const code = id.replace('tr_logement_', '');
+    const tds = await row.locator('td').allTextContents().catch(() => []);
+    const at = (n) => (tds[n] || '').replace(/\s+/g, ' ').trim();
+
     result.push({
-      code,
-      type: idxType !== -1 ? tds[idxType]?.trim() || '' : '',
-      rowIndex: i,
+      code, // = td[1] mais on le tient déjà via l'id, plus fiable
+      checkboxId: `check_logement_${code}`,
+      type: at(2),
+      // La cellule colocation colle "Oui"/"Non" et une mention "Loyer
+      // (non) solidaire" : on insère une espace entre les deux pour lisibilité.
+      colocation: at(3).replace(/(Oui|Non)(Loyer)/i, '$1 — $2'),
+      nbOccupants: at(4),
+      pmr: at(5),
+      surface: at(6).replace(/m2\b/, 'm²'),
+      balcon: at(7),
+      boursier: at(8),
+      loyer: at(9),
+      depotGarantie: at(10),
+      fraisDossier: at(11),
     });
   }
+  if (result.length === 0) {
+    await dumpDebugHtml(page, 'aucun_tr_logement_visible');
+  }
   return result;
+}
+
+/** Formate les caractéristiques d'un logement en lignes lisibles pour Telegram. */
+function formatLogementDetails(l) {
+  return [
+    `🔑 N° logement : ${l.code}`,
+    `🏷️ Type : ${l.type}`,
+    `👥 Colocation : ${l.colocation}`,
+    `🔢 Nbr occupants : ${l.nbOccupants}`,
+    `📐 Surface : ${l.surface}`,
+    `💶 Loyer charges comprises : ${l.loyer}`,
+    `🔒 Dépôt garantie : ${l.depotGarantie}`,
+    `📄 Frais de dossier : ${l.fraisDossier}`,
+  ].join('\n');
 }
 
 /**
@@ -355,173 +369,78 @@ export async function reserve(dispoResidences, _nodes, opts = {}) {
     await page.waitForTimeout(2000);
     await screenshot('H', `Niveau coché : ${chemin}\nTableau "Logements disponibles" attendu`);
 
-    // ── Étape H.5 : lire la liste des logements dispo (code + type) ──────────
-    // Table "Logements disponibles" avec colonnes RÉSERVATION ? / N° LOGEMENT /
-    // TYPE LOGEMENT (ex: 6CA306 / T1). Sert à 1) choisir un logement pas déjà
-    // notifié aujourd'hui (anti-doublon), 2) l'inclure dans la notif finale.
+    // ── Étape I : lire le tableau des logements (TOUT est là) ────────────────
+    // Chaque logement dispo est une ligne <tr id="tr_logement_XXX"> contenant
+    // déjà code / type / colocation / occupants / surface / loyer / etc. AUCUN
+    // bouton "Réserver" : la colonne "Réservation ?" est un toggle
+    // #check_logement_XXX qu'on coche pour ouvrir le formulaire de validation.
     const logements = await readLogementsDisponibles(page);
-    console.log(`[reserve] Logements trouvés dans le tableau : ${JSON.stringify(logements)}`);
+    console.log(`[reserve] Logements trouvés : ${JSON.stringify(logements)}`);
 
-    let chosen = logements[0] || null;
-    if (logements.length > 0) {
-      const { filterNewCodes } = await import('./seen.js');
-      const newCodes = filterNewCodes(logements.map((l) => l.code));
-      const notYetSeen = logements.filter((l) => newCodes.includes(l.code));
-      if (notYetSeen.length === 0) {
-        // Tous les logements de ce niveau ont déjà été notifiés aujourd'hui.
-        await notify(
-          `ℹ️ <b>${chemin}</b> : logement(s) ${logements.map((l) => l.code).join(', ')} déjà notifié(s) aujourd'hui → pas de nouvelle alerte${commit ? ', pas de re-réservation' : ''}.`
-        );
-        return;
-      }
-      chosen = notYetSeen[0];
+    if (logements.length === 0) {
+      await screenshot('I_ERREUR', '❌ Aucune ligne de logement (tr_logement_*) trouvée');
+      await dumpHtml('I_ERREUR');
+      throw new Error('Aucun logement lisible dans le tableau — voir HTML debug');
     }
 
-    // ── Étape I : cliquer "Réserver" dans le tableau ──────────────────────────
-    // On cible la ligne du logement choisi (par son code) si on l'a identifié,
-    // sinon on retombe sur le premier bouton "Réserver" trouvé sur la page.
-    let reserverBtn = null;
-    if (chosen) {
-      const row = page.locator('tr', { hasText: chosen.code });
-      const rowBtn = row.locator(
-        'button:has-text("Réserver"), a:has-text("Réserver"), input[value="Réserver"], [onclick*="eserver"]'
-      ).first();
-      if (await rowBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
-        reserverBtn = rowBtn;
-      }
+    // Anti-doublon quotidien : on ne re-notifie pas les mêmes codes le même jour.
+    const { filterNewCodes, markSeen } = await import('./seen.js');
+    const newCodes = filterNewCodes(logements.map((l) => l.code));
+    const notYetSeen = logements.filter((l) => newCodes.includes(l.code));
+    if (notYetSeen.length === 0) {
+      await notify(
+        `ℹ️ <b>${chemin}</b> : logement(s) ${logements.map((l) => l.code).join(', ')} déjà notifié(s) aujourd'hui → pas de nouvelle alerte${commit ? ', pas de re-réservation' : ''}.`
+      );
+      return;
     }
-    if (!reserverBtn) {
-      // On essaie plusieurs sélecteurs génériques car le texte exact peut varier
-      const reserverSelectors = [
-        'button:has-text("Réserver")',
-        'a:has-text("Réserver")',
-        'input[value="Réserver"]',
-        'button:has-text("réserver")',
-        '[onclick*="reserver"]',
-        '[onclick*="Reserver"]',
-        '.btn:has-text("Réser")',
-      ];
-      for (const sel of reserverSelectors) {
-        const el = page.locator(sel).first();
-        if (await el.isVisible({ timeout: 2000 }).catch(() => false)) {
-          reserverBtn = el;
-          console.log(`[reserve] Bouton Réserver trouvé avec : ${sel}`);
-          break;
-        }
-      }
-    }
+    const chosen = notYetSeen[0];
+    const details = formatLogementDetails(chosen);
+    markSeen(logements.map((l) => l.code));
 
-    if (!reserverBtn) {
-      await screenshot('I_ERREUR', '❌ Bouton "Réserver" introuvable dans le tableau');
-      throw new Error('Bouton Réserver introuvable — voir screenshot étape I_ERREUR');
-    }
+    await screenshot('I', `Tableau des logements — ${chosen.code}`);
 
-    await screenshot('I', 'Tableau "Logements disponibles" — bouton Réserver trouvé');
-    await dumpHtml('I');
-    await reserverBtn.click();
-    await page.waitForTimeout(1500);
-    await screenshot('I2', 'Après clic Réserver — formulaire de confirmation attendu');
-    await dumpHtml('I2');
-
-    // ── Étape J : formulaire de confirmation #formulaire_voeu ─────────────────
-    // Attendre que le formulaire de confirmation soit visible
-    await page.locator('#formulaire_voeu').waitFor({ state: 'visible', timeout: 10000 });
-    await screenshot('J', 'Formulaire "Votre réservation de logement" — détails du logement');
-    await dumpHtml('J');
-
-    // Extraction des caractéristiques du logement affichées dans le tableau
-    // "Votre réservation de logement" (#formulaire_voeu).
-    //
-    // ⚠️ CONFIRMÉ par capture Telegram d'un vrai cas (logement 6CA306) : ce
-    // tableau a bien 10 <th> ET 10 <td> (nombre de colonnes égal — pas de
-    // colonne en trop), MAIS les valeurs sont décalées d'UNE POSITION vers la
-    // gauche par rapport à leurs propres en-têtes : tds[0] ("sous" l'en-tête
-    // "Type logement") contient en fait le CODE logement (6CA306), tds[1]
-    // ("sous" "Colocation ?") contient le vrai TYPE (T1), tds[2] ("sous" "Nbr
-    // occupants") contient la vraie colocation (Non), etc. C'est un bug
-    // d'alignement du site lui-même (probablement une colonne "N° logement"
-    // existe dans les données mais son <th> a été supprimé du template),
-    // pas un problème de lecture. La dernière valeur logique (Frais de
-    // dossier) sort donc du tableau (il n'y a plus de td pour elle).
-    //
-    // On lit donc par décalage fixe de +1, avec repli sur les libellés de
-    // <th> réels seulement si jamais le nombre de td dépasse celui des th
-    // (auquel cas la table aurait vraiment une colonne en plus et le décalage
-    // serait ailleurs).
-    const logementInfo = await (async () => {
-      const tds = await page.locator('#tr_formulaire_voeu td').allTextContents().catch(() => []);
-      if (!tds.length) return null;
-      const at = (i) => tds[i]?.trim() || '';
-
-      return {
-        code: at(0),
-        typeLogement: at(1),
-        colocation: at(2),
-        nbOccupants: at(3),
-        pmr: at(4),
-        surface: at(5),
-        balcon: at(6),
-        boursier: at(7),
-        loyer: at(8),
-        depotGarantie: at(9),
-        fraisDossier: '', // perdu : décalage de +1 fait sortir cette valeur du tableau
-      };
-    })().catch(() => null);
-
-    // Repli : si le code lu ici est vide (tableau finalement pas décalé, ou
-    // structure différente), on garde celui identifié plus tôt dans le
-    // tableau "Logements disponibles".
-    if (logementInfo && !logementInfo.code && chosen) logementInfo.code = chosen.code;
-
-    const detailsLines = logementInfo
-      ? [
-          `🔑 N° logement : ${logementInfo.code || chosen?.code || '?'}`,
-          `🏷️ Type : ${logementInfo.typeLogement}`,
-          `👥 Colocation : ${logementInfo.colocation}`,
-          `🔢 Nbr occupants : ${logementInfo.nbOccupants}`,
-          `📐 Surface : ${logementInfo.surface}`,
-          `💶 Loyer charges comprises : ${logementInfo.loyer}`,
-          `🔒 Dépôt garantie : ${logementInfo.depotGarantie}`,
-          `📄 Frais de dossier : ${logementInfo.fraisDossier}`,
-        ].join('\n')
-      : '⚠️ Détails du logement non récupérés (structure de page inattendue).';
-
-    // Anti-doublon : ce logement (et les autres du même niveau) ne seront plus
-    // re-notifiés aujourd'hui, qu'on réserve ou non.
-    if (logements.length > 0) {
-      const { markSeen } = await import('./seen.js');
-      markSeen(logements.map((l) => l.code));
-    }
-
-    // ── Mode "captures + détails" (résidences hors III/IV) ───────────────────
-    // On a lu toutes les infos du formulaire de confirmation, mais on NE clique
-    // PAS "Valider votre réservation" : aucune réservation réelle n'est faite.
+    // ── Résidence hors III/IV : on informe et on s'arrête, point. ────────────
+    // Pas de clic, pas de formulaire : juste le message avec toutes les infos.
     if (!commit) {
       await notify(
-        `📸 <b>Logement détaillé (pas de réservation)</b>\n\n` +
+        `🏠 <b>Logement disponible !</b>\n\n` +
         `📍 ${chemin}\n\n` +
-        `${detailsLines}\n\n` +
-        `ℹ️ Cette résidence n'est pas III/IV → je n'ai rien réservé.\n` +
-        `👉 Si tu veux la prendre, réserve à la main : ${URLS.reservation}`
+        `${details}\n\n` +
+        `ℹ️ Résidence hors III/IV → je ne réserve pas automatiquement.\n` +
+        `👉 Pour la prendre, réserve à la main : ${URLS.reservation}`
       );
       return;
     }
 
-    // Cliquer "Valider votre réservation" (appelle submit_reservation() en JS)
-    const validerBtn = page.locator(
-      'button:has-text("Valider votre réservation"), [onclick*="submit_reservation"]'
-    ).first();
+    // ── Résidence III/IV : cocher le toggle logement → formulaire → valider ──
+    const logementCheckbox = page.locator(`#${chosen.checkboxId}`);
+    await checkToggle(logementCheckbox);
+    await page.waitForTimeout(1500);
+
+    // Le clic ci-dessus affiche #formulaire_voeu (via le JS du site).
+    await page.locator('#formulaire_voeu').waitFor({ state: 'visible', timeout: 10000 });
+    await screenshot('J', 'Formulaire de confirmation affiché');
+
+    // "Valider votre réservation" → submit_reservation() ouvre une popup de
+    // confirmation jquery-confirm dont le bouton "Valider" soumet réellement.
+    const validerBtn = page.locator('[onclick*="submit_reservation"]').first();
     await validerBtn.waitFor({ state: 'visible', timeout: 5000 });
     await validerBtn.click();
+    await page.waitForTimeout(1000);
+
+    // Popup de confirmation "Êtes-vous sûr..." (jquery-confirm) → bouton bleu Valider.
+    const popupValider = page.locator('.jconfirm-buttons button:has-text("Valider")').first();
+    if (await popupValider.isVisible({ timeout: 3000 }).catch(() => false)) {
+      await popupValider.click();
+    }
 
     await page.waitForTimeout(2000);
     await screenshot('K', 'Après "Valider votre réservation" — résultat final');
-    await dumpHtml('K');
 
     await notify(
       `✅ <b>Réservation tentée !</b>\n\n` +
       `📍 ${chemin}\n\n` +
-      `${detailsLines}\n\n` +
+      `${details}\n\n` +
       `⚠️ VÉRIFIE sur le site que la réservation est bien confirmée :\n${URLS.reservation}`
     );
 

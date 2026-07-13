@@ -236,19 +236,20 @@ export async function checkOnce() {
         `🏠 <b>LOGEMENT DISPONIBLE CHEZ CESAL !</b>\n\n` +
         buildDispoMessage(dispoResidences, nodes) +
         `\n\nℹ️ <b>Ce n'est PAS une Résidence III/IV</b> → je ne réserve PAS,` +
-        ` mais je fais les captures pour vérification (screenshots à suivre).` +
+        ` je récupère juste les détails du logement (prix, surface, colocation…).` +
         `\n👉 Si ça t'intéresse, réserve à la main :` +
         `\n🔗 ${URLS.reservation}`
       );
     }
 
-    // On lance Playwright dans TOUS les cas (captures), mais commit=true seulement
-    // pour III/IV. Nécessite le mode reserve (sinon pas d'ouverture de navigateur).
+    // On lance Playwright dans TOUS les cas, mais commit=true seulement pour
+    // III/IV. Pour les autres, on navigue juste pour lire les détails du
+    // logement. Nécessite le mode reserve (sinon pas d'ouverture de navigateur).
     if (config.mode === 'reserve') {
       await notify(
         isEligible
           ? '🤖 Lancement de la réservation auto (Résidence III/IV)…'
-          : '📸 Ouverture du navigateur pour les captures (sans réserver)…'
+          : '🔎 Récupération des détails du logement…'
       );
       // La réservation (Playwright) est protégée par un TIMEOUT GLOBAL DUR : si
       // elle se bloque (ex. Chromium qui gèle), on abandonne au bout de 3 min et
