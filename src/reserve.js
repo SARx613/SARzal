@@ -399,36 +399,41 @@ export async function reserve(dispoResidences, _nodes, opts = {}) {
 
     await screenshot('I', `Tableau des logements — ${chosen.code}`);
 
-    // ── Résidence hors III/IV : on informe et on s'arrête, point. ────────────
-    // Pas de clic, pas de formulaire : juste le message avec toutes les infos.
+    // ── Cocher le toggle du logement → ouvre le formulaire "Votre réservation
+    //    de logement" (#formulaire_voeu). On fait ça DANS TOUS LES CAS :
+    //    - III/IV : c'est l'étape avant de valider la réservation ;
+    //    - autres : ça affiche le tableau final dont on capture le HTML, pour
+    //      documenter la structure exacte (utile pour préparer une vraie
+    //      réservation future). D'après le JS du site, cocher ce toggle ne fait
+    //      QU'AFFICHER le formulaire (display:block) — aucun appel serveur, donc
+    //      rien n'est réservé tant qu'on ne clique pas "Valider".
+    const logementCheckbox = page.locator(`#${chosen.checkboxId}`);
+    await checkToggle(logementCheckbox);
+    await page.waitForTimeout(1500);
+    await page.locator('#formulaire_voeu').waitFor({ state: 'visible', timeout: 10000 });
+    await screenshot('J', 'Tableau "Votre réservation de logement"');
+    await dumpHtml('J'); // HTML exact du formulaire final, envoyé sur Telegram
+
+    // ── Hors III/IV : on s'arrête ICI, formulaire ouvert mais NON validé. ────
     if (!commit) {
       await notify(
         `🏠 <b>Logement disponible !</b>\n\n` +
         `📍 ${chemin}\n\n` +
         `${details}\n\n` +
-        `ℹ️ Résidence hors III/IV → je ne réserve pas automatiquement.\n` +
+        `ℹ️ Résidence hors III/IV → formulaire ouvert pour capture, mais je ne valide PAS.\n` +
         `👉 Pour la prendre, réserve à la main : ${URLS.reservation}`
       );
       return;
     }
 
-    // ── Résidence III/IV : cocher le toggle logement → formulaire → valider ──
-    const logementCheckbox = page.locator(`#${chosen.checkboxId}`);
-    await checkToggle(logementCheckbox);
-    await page.waitForTimeout(1500);
-
-    // Le clic ci-dessus affiche #formulaire_voeu (via le JS du site).
-    await page.locator('#formulaire_voeu').waitFor({ state: 'visible', timeout: 10000 });
-    await screenshot('J', 'Formulaire de confirmation affiché');
-
-    // "Valider votre réservation" → submit_reservation() ouvre une popup de
-    // confirmation jquery-confirm dont le bouton "Valider" soumet réellement.
+    // ── III/IV : cliquer "Valider votre réservation" pour réserver réellement.
+    // submit_reservation() ouvre une popup jquery-confirm dont le bouton
+    // "Valider" soumet vraiment le formulaire.
     const validerBtn = page.locator('[onclick*="submit_reservation"]').first();
     await validerBtn.waitFor({ state: 'visible', timeout: 5000 });
     await validerBtn.click();
     await page.waitForTimeout(1000);
 
-    // Popup de confirmation "Êtes-vous sûr..." (jquery-confirm) → bouton bleu Valider.
     const popupValider = page.locator('.jconfirm-buttons button:has-text("Valider")').first();
     if (await popupValider.isVisible({ timeout: 3000 }).catch(() => false)) {
       await popupValider.click();
