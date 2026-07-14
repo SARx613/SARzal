@@ -40,3 +40,28 @@ export function markSeen(codes) {
   state.codes = [...seen];
   save(state);
 }
+
+/**
+ * Anti-spam basé sur une SIGNATURE de disponibilité (indépendant du code
+ * logement, qui n'est lisible qu'après ouverture du navigateur). La signature
+ * est l'ensemble trié des niveaux disponibles détectés lors du scan HTTP
+ * (ex: "niveau_1_D_0_0|niveau_3_A_G_2"). Tant que cette signature ne change
+ * pas, on considère qu'on a déjà traité/notifié cette situation aujourd'hui,
+ * et on n'ouvre PAS le navigateur (donc pas de nouveaux screenshots).
+ *
+ * Renvoie true si la signature est NOUVELLE (à traiter), false si déjà vue.
+ */
+export function isNewSignature(signature) {
+  const state = load();
+  const seenSigs = new Set(state.signatures || []);
+  return !seenSigs.has(signature);
+}
+
+/** Enregistre une signature de disponibilité comme traitée pour aujourd'hui. */
+export function markSignatureSeen(signature) {
+  const state = load();
+  const seenSigs = new Set(state.signatures || []);
+  seenSigs.add(signature);
+  state.signatures = [...seenSigs];
+  save(state);
+}

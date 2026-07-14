@@ -241,13 +241,19 @@ export async function reserve(dispoResidences, _nodes, opts = {}) {
   page.setDefaultTimeout(15_000);
   page.setDefaultNavigationTimeout(30_000);
 
-  /** Prend un screenshot et l'envoie sur Telegram + le sauvegarde localement. */
-  const screenshot = async (stepName, caption) => {
+  /**
+   * Prend un screenshot. Par défaut il est SILENCIEUX sur Telegram (sauvegardé
+   * seulement en local pour debug) afin de ne pas spammer le chat avec 6 photos
+   * de navigation à chaque logement. Passer { toTelegram: true } pour les
+   * étapes vraiment importantes (erreurs, résultat final de réservation).
+   */
+  const screenshot = async (stepName, caption, { toTelegram = false } = {}) => {
     try {
       const buf = await page.screenshot({ fullPage: true });
-      // Envoi Telegram
-      await notifyPhoto(`📸 <b>Étape ${stepName}</b>\n${caption}`, buf);
-      // Sauvegarde locale pour debug
+      if (toTelegram) {
+        await notifyPhoto(`📸 <b>Étape ${stepName}</b>\n${caption}`, buf);
+      }
+      // Sauvegarde locale systématique (debug, récupérable via SSH)
       const { writeFileSync } = await import('fs');
       const p = new URL(`../config/reserve_step_${stepName}.png`, import.meta.url).pathname;
       writeFileSync(p, buf);
@@ -326,7 +332,7 @@ export async function reserve(dispoResidences, _nodes, opts = {}) {
     // Les cases #check_batiment_N_X sont injectées en AJAX après le clic résidence.
     const aileResult = await findFirstCheckbox(page, `check_batiment_${resNum}_`);
     if (!aileResult) {
-      await screenshot('F_ERREUR', '❌ Aucune case batiment trouvée sur la page');
+      await screenshot('F_ERREUR', '❌ Aucune case batiment trouvée sur la page', { toTelegram: true });
       throw new Error(`Aucune aile trouvée sur la page pour ${target.label}`);
     }
     const { checkbox: aileCheckbox, id: aileId } = aileResult;
@@ -341,7 +347,7 @@ export async function reserve(dispoResidences, _nodes, opts = {}) {
     // ── Étape G : cocher le premier escalier disponible (découverte live) ─────
     const cageResult = await findFirstCheckbox(page, `check_cage_${resNum}_${aileNum}_`);
     if (!cageResult) {
-      await screenshot('G_ERREUR', '❌ Aucune case cage/escalier trouvée sur la page');
+      await screenshot('G_ERREUR', '❌ Aucune case cage/escalier trouvée sur la page', { toTelegram: true });
       throw new Error(`Aucun escalier trouvé sur la page pour Aile ${aileNum}`);
     }
     const { checkbox: cageCheckbox, id: cageId } = cageResult;
@@ -355,7 +361,7 @@ export async function reserve(dispoResidences, _nodes, opts = {}) {
     // ── Étape H : cocher le premier niveau disponible (découverte live) ───────
     const niveauResult = await findFirstCheckbox(page, `check_niveau_${resNum}_${aileNum}_${cageIdx}_`);
     if (!niveauResult) {
-      await screenshot('H_ERREUR', '❌ Aucune case niveau trouvée sur la page');
+      await screenshot('H_ERREUR', '❌ Aucune case niveau trouvée sur la page', { toTelegram: true });
       throw new Error('Aucun niveau trouvé sur la page');
     }
     const { checkbox: niveauCheckbox, id: niveauId } = niveauResult;
@@ -378,7 +384,7 @@ export async function reserve(dispoResidences, _nodes, opts = {}) {
     console.log(`[reserve] Logements trouvés : ${JSON.stringify(logements)}`);
 
     if (logements.length === 0) {
-      await screenshot('I_ERREUR', '❌ Aucune ligne de logement (tr_logement_*) trouvée');
+      await screenshot('I_ERREUR', '❌ Aucune ligne de logement (tr_logement_*) trouvée', { toTelegram: true });
       await dumpHtml('I_ERREUR');
       throw new Error('Aucun logement lisible dans le tableau — voir HTML debug');
     }
@@ -397,34 +403,45 @@ export async function reserve(dispoResidences, _nodes, opts = {}) {
     const details = formatLogementDetails(chosen);
     markSeen(logements.map((l) => l.code));
 
+    // ── Message des DÉTAILS envoyé IMMÉDIATEMENT ─────────────────────────────
+    // Toutes les caractéristiques (code, type, loyer, surface, colocation…) sont
+    // déjà dans `chosen`, lu depuis le tableau "Logements disponibles". On envoie
+    // le message MAINTENANT, AVANT toute étape navigateur fragile (cocher le
+    // toggle, attendre #formulaire_voeu…), pour qu'un crash/timeout ultérieur du
+    // navigateur ne fasse jamais perdre l'info la plus importante.
+    const logementsListe = logements.length > 1
+      ? `\n\n📋 <b>Tous les logements dispo ici</b> (${logements.length}) : ` +
+        logements.map((l) => `${l.code} (${l.type}, ${l.loyer})`).join(', ')
+      : '';
+    await notify(
+      `🏠 <b>Logement disponible !</b>\n\n` +
+      `📍 ${chemin}\n\n` +
+      `${details}` +
+      logementsListe +
+      (commit
+        ? `\n\n🎯 Résidence III/IV → je tente la réservation auto…`
+        : `\n\nℹ️ Résidence hors III/IV → je ne valide PAS.\n👉 Pour la prendre, réserve à la main : ${URLS.reservation}`)
+    );
+
     await screenshot('I', `Tableau des logements — ${chosen.code}`);
 
-    // ── Cocher le toggle du logement → ouvre le formulaire "Votre réservation
-    //    de logement" (#formulaire_voeu). On fait ça DANS TOUS LES CAS :
-    //    - III/IV : c'est l'étape avant de valider la réservation ;
-    //    - autres : ça affiche le tableau final dont on capture le HTML, pour
-    //      documenter la structure exacte (utile pour préparer une vraie
-    //      réservation future). D'après le JS du site, cocher ce toggle ne fait
-    //      QU'AFFICHER le formulaire (display:block) — aucun appel serveur, donc
-    //      rien n'est réservé tant qu'on ne clique pas "Valider".
+    // ── Hors III/IV : on s'arrête ICI. Les détails sont déjà envoyés ; inutile
+    //    d'ouvrir le formulaire (étape fragile) puisqu'on ne réserve pas. ──────
+    if (!commit) {
+      return;
+    }
+
+    // ── III/IV uniquement : cocher le toggle du logement → ouvre le formulaire
+    //    "Votre réservation de logement" (#formulaire_voeu). D'après le JS du
+    //    site, cocher ce toggle ne fait QU'AFFICHER le formulaire (display:block)
+    //    — aucun appel serveur, rien n'est réservé tant qu'on ne clique pas
+    //    "Valider".
     const logementCheckbox = page.locator(`#${chosen.checkboxId}`);
     await checkToggle(logementCheckbox);
     await page.waitForTimeout(1500);
     await page.locator('#formulaire_voeu').waitFor({ state: 'visible', timeout: 10000 });
     await screenshot('J', 'Tableau "Votre réservation de logement"');
     await dumpHtml('J'); // HTML exact du formulaire final, envoyé sur Telegram
-
-    // ── Hors III/IV : on s'arrête ICI, formulaire ouvert mais NON validé. ────
-    if (!commit) {
-      await notify(
-        `🏠 <b>Logement disponible !</b>\n\n` +
-        `📍 ${chemin}\n\n` +
-        `${details}\n\n` +
-        `ℹ️ Résidence hors III/IV → formulaire ouvert pour capture, mais je ne valide PAS.\n` +
-        `👉 Pour la prendre, réserve à la main : ${URLS.reservation}`
-      );
-      return;
-    }
 
     // ── III/IV : cliquer "Valider votre réservation" pour réserver réellement.
     // submit_reservation() ouvre une popup jquery-confirm dont le bouton
@@ -440,7 +457,7 @@ export async function reserve(dispoResidences, _nodes, opts = {}) {
     }
 
     await page.waitForTimeout(2000);
-    await screenshot('K', 'Après "Valider votre réservation" — résultat final');
+    await screenshot('K', 'Après "Valider votre réservation" — résultat final', { toTelegram: true });
 
     await notify(
       `✅ <b>Réservation tentée !</b>\n\n` +
