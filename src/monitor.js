@@ -211,6 +211,26 @@ export async function checkOnce() {
   const dispoResidences = availableResidences(nodes);
 
   if (dispoResidences.length > 0) {
+    // ── ANTI-SPAM ────────────────────────────────────────────────────────────
+    // Signature = ensemble trié des niveaux disponibles (détectés en HTTP, sans
+    // navigateur). Tant qu'elle ne change pas, on a déjà traité cette situation
+    // aujourd'hui : on n'envoie AUCUN message et on n'ouvre PAS le navigateur
+    // (évite le spam de 15 notifs + screenshots à chaque cycle de 3 min). Une
+    // nouvelle dispo (autre niveau) change la signature et relance le flux.
+    const { isNewSignature, markSignatureSeen } = await import('./seen.js');
+    const dispoLevels = Object.entries(nodes)
+      .filter(([id, v]) => v.available && /^niveau_/.test(id))
+      .map(([id]) => id)
+      .sort();
+    // Repli : si aucun niveau parsé (structure inattendue), on retombe sur les
+    // résidences dispo pour ne pas perdre l'alerte.
+    const signature = (dispoLevels.length ? dispoLevels : dispoResidences.map((r) => r.id).sort()).join('|');
+    if (!isNewSignature(signature)) {
+      console.log(`[check] Signature déjà traitée aujourd'hui (${signature}) — pas de nouvelle notif.`);
+      return { available: true, alreadyNotified: true, nodes };
+    }
+    markSignatureSeen(signature);
+
     // On ne RÉSERVE réellement que pour les Résidences III / IV. Pour les autres,
     // on ouvre quand même le navigateur pour prendre les captures (documentation),
     // mais sans jamais cliquer "Réserver"/"Valider" (commit=false).
@@ -246,11 +266,6 @@ export async function checkOnce() {
     // III/IV. Pour les autres, on navigue juste pour lire les détails du
     // logement. Nécessite le mode reserve (sinon pas d'ouverture de navigateur).
     if (config.mode === 'reserve') {
-      await notify(
-        isEligible
-          ? '🤖 Lancement de la réservation auto (Résidence III/IV)…'
-          : '🔎 Récupération des détails du logement…'
-      );
       // La réservation (Playwright) est protégée par un TIMEOUT GLOBAL DUR : si
       // elle se bloque (ex. Chromium qui gèle), on abandonne au bout de 3 min et
       // on RENDS LA MAIN à la surveillance — elle ne doit jamais mourir en silence.
