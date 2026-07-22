@@ -257,7 +257,10 @@ export async function checkOnce() {
       await notify(
         `🏠 <b>LOGEMENT DISPONIBLE CHEZ CESAL !</b>\n\n` +
         buildDispoMessage(dispoResidences, nodes) +
-        `\n\n🎯 <b>Résidence III/IV détectée → le bot tente la réservation auto</b> (screenshots à suivre).` +
+        `\n\n🎯 <b>Résidence III/IV détectée → le bot analyse le logement.</b>` +
+        `\n   • Logement individuel → il réserve automatiquement.` +
+        `\n   • Colocation (email colocataire exigé par le site) → il NE PEUT PAS,` +
+        ` il t'alerte pour que tu réserves à la main.` +
         `\n⚡ <b>EN BACKUP, réserve TOI AUSSI à la main tout de suite :</b>` +
         `\n🔗 ${URLS.reservation}`
       );
