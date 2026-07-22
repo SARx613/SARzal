@@ -11,9 +11,8 @@ export const config = {
   headless: process.env.HEADLESS !== 'false',
 
   // ── Surveillance rapide (fetch HTTP pur, pas de navigateur permanent) ──────
-  // Intervalle CONSTANT entre deux checks, en SECONDES — identique jour et nuit
-  // (pas de ralentissement nocturne, pas de jitter : choix utilisateur d'une
-  // surveillance uniforme 24/7). Défaut 25s ; ajustable via le secret Fly
+  // Intervalle de base entre deux checks, en SECONDES — identique jour et nuit
+  // (pas de ralentissement nocturne). Défaut 25s ; ajustable via le secret Fly
   // INTERVAL_SECONDS sans redéployer. Si INTERVAL_SECONDS n'est pas défini mais
   // INTERVAL_MINUTES l'est, on retombe sur les minutes (rétro-compatible).
   intervalSeconds: parseInt(
@@ -21,6 +20,9 @@ export const config = {
       String((parseInt(process.env.INTERVAL_MINUTES || '0', 10) || 0) * 60 || 25),
     10
   ),
+  // Jitter : on ajoute ±jitterSeconds aléatoires à chaque cycle pour NE PAS
+  // taper à une périodicité robotique parfaite (garde-fou anti-détection).
+  jitterSeconds: parseInt(process.env.JITTER_SECONDS || '4', 10),
   // Plafond du backoff exponentiel appliqué sur 429/5xx/erreur réseau.
   maxBackoffSeconds: parseInt(process.env.MAX_BACKOFF_SECONDS || '300', 10),
 };

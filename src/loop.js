@@ -5,22 +5,26 @@ import { notify } from './notify.js';
 const HEARTBEAT_MS = 6 * 60 * 60_000; // toutes les 6h : "je suis toujours en vie"
 
 /**
- * Délai (ms) avant le prochain check. Intervalle CONSTANT, identique jour et
- * nuit (choix utilisateur : surveillance uniforme 24/7, sans ralentissement
- * nocturne ni jitter). Plancher de sécurité : jamais < 3s.
+ * Délai (ms) avant le prochain check. Intervalle identique jour et nuit (pas de
+ * ralentissement nocturne) + jitter aléatoire ±jitterSeconds pour ne PAS taper
+ * à une périodicité robotique parfaite (garde-fou anti-détection). Plancher de
+ * sécurité : jamais < 3s.
  */
 function nextDelayMs() {
-  return Math.max(3, config.intervalSeconds) * 1000;
+  const jitter = config.jitterSeconds;
+  const deltaS = jitter > 0 ? (Math.random() * 2 - 1) * jitter : 0;
+  const s = Math.max(3, config.intervalSeconds + deltaS);
+  return Math.round(s * 1000);
 }
 
 /**
  * Boucle de surveillance rapide (fetch HTTP pur, pas de navigateur permanent).
  *
- * Intervalle CONSTANT 24/7 (pas de ralentissement nuit, pas de jitter).
- * Seul garde-fou conservé : BACKOFF exponentiel sur 429 / 5xx / erreur réseau
- * — on double le délai (plafonné à maxBackoffSeconds) tant que ça échoue, puis
- * retour au rythme normal dès le 1er cycle réussi. Un rate-limit ignoré =
- * risque de ban IP.
+ * Intervalle identique 24/7 (pas de ralentissement nuit), avec jitter ±N s
+ * pour casser la périodicité robotique. Garde-fou serveur : BACKOFF exponentiel
+ * sur 429 / 5xx / erreur réseau — on double le délai (plafonné à
+ * maxBackoffSeconds) tant que ça échoue, puis retour au rythme normal dès le
+ * 1er cycle réussi. Un rate-limit ignoré = risque de ban IP.
  */
 async function loop() {
   const startedAt = Date.now();
@@ -30,10 +34,10 @@ async function loop() {
   let backoffS = 0; // 0 = pas de backoff en cours
 
   console.log(
-    `Moniteur CESAL démarré — check toutes les ${config.intervalSeconds}s (constant 24/7), mode: ${config.mode}.`
+    `Moniteur CESAL démarré — check ~${config.intervalSeconds}s (±${config.jitterSeconds}s, jour et nuit), mode: ${config.mode}.`
   );
   await notify(
-    `🚀 Moniteur CESAL démarré (mode: ${config.mode}, intervalle ${config.intervalSeconds}s constant, jour et nuit).`
+    `🚀 Moniteur CESAL démarré (mode: ${config.mode}, intervalle ~${config.intervalSeconds}s ±${config.jitterSeconds}s, jour et nuit).`
   );
 
   for (;;) {
@@ -87,7 +91,7 @@ async function loop() {
     }
 
     // ── Attente avant le prochain cycle ───────────────────────────────────
-    // En backoff : délai fixe = backoffS. Sinon : intervalle constant, moins
+    // En backoff : délai fixe = backoffS. Sinon : intervalle + jitter, moins
     // le temps déjà passé dans checkOnce (pour tenir la cadence réelle).
     let waitMs;
     if (backoffS) {
