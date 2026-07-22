@@ -4,45 +4,23 @@ import { notify } from './notify.js';
 
 const HEARTBEAT_MS = 6 * 60 * 60_000; // toutes les 6h : "je suis toujours en vie"
 
-/** Parse "startH-endH" (ex. "2-6") en {start, end}. Plage vide si invalide. */
-function parseNightHours(spec) {
-  const m = String(spec || '').match(/^\s*(\d{1,2})\s*-\s*(\d{1,2})\s*$/);
-  if (!m) return null;
-  return { start: parseInt(m[1], 10), end: parseInt(m[2], 10) };
-}
-
-/** True si l'heure courante (UTC de la VM) tombe dans la plage nocturne. */
-function isNight(nightHours) {
-  if (!nightHours) return false;
-  const h = new Date().getHours();
-  const { start, end } = nightHours;
-  // Plage simple (2-6) ou qui passe minuit (22-6).
-  return start <= end ? h >= start && h < end : h >= start || h < end;
-}
-
 /**
- * Délai (ms) avant le prochain check. Intervalle de base (jour ou nuit) +
- * jitter aléatoire ±jitterSeconds pour casser toute périodicité robotique.
+ * Délai (ms) avant le prochain check. Intervalle CONSTANT, identique jour et
+ * nuit (choix utilisateur : surveillance uniforme 24/7, sans ralentissement
+ * nocturne ni jitter). Plancher de sécurité : jamais < 3s.
  */
-function nextDelayMs(nightHours) {
-  const baseS = isNight(nightHours)
-    ? config.nightIntervalSeconds
-    : config.intervalSeconds;
-  const jitter = config.jitterSeconds;
-  const deltaS = jitter > 0 ? (Math.random() * 2 - 1) * jitter : 0;
-  const s = Math.max(3, baseS + deltaS); // plancher de sécurité : jamais < 3s
-  return Math.round(s * 1000);
+function nextDelayMs() {
+  return Math.max(3, config.intervalSeconds) * 1000;
 }
 
 /**
  * Boucle de surveillance rapide (fetch HTTP pur, pas de navigateur permanent).
  *
- * Garde-fous anti-ban :
- *  - jitter sur chaque intervalle (pas de signature de périodicité parfaite) ;
- *  - ralentissement nocturne (nightHours → nightIntervalSeconds) ;
- *  - BACKOFF exponentiel sur 429 / 5xx / erreur réseau : on double le délai
- *    (plafonné à maxBackoffSeconds) tant que ça échoue, puis retour au rythme
- *    normal dès le 1er cycle réussi. Un rate-limit ignoré = risque de ban IP.
+ * Intervalle CONSTANT 24/7 (pas de ralentissement nuit, pas de jitter).
+ * Seul garde-fou conservé : BACKOFF exponentiel sur 429 / 5xx / erreur réseau
+ * — on double le délai (plafonné à maxBackoffSeconds) tant que ça échoue, puis
+ * retour au rythme normal dès le 1er cycle réussi. Un rate-limit ignoré =
+ * risque de ban IP.
  */
 async function loop() {
   const startedAt = Date.now();
@@ -51,15 +29,11 @@ async function loop() {
   let lastHeartbeat = 0;
   let backoffS = 0; // 0 = pas de backoff en cours
 
-  const nightHours = parseNightHours(config.nightHours);
-
   console.log(
-    `Moniteur CESAL démarré — check ~${config.intervalSeconds}s (±${config.jitterSeconds}s, ` +
-      `nuit ${config.nightIntervalSeconds}s sur ${config.nightHours}h), mode: ${config.mode}.`
+    `Moniteur CESAL démarré — check toutes les ${config.intervalSeconds}s (constant 24/7), mode: ${config.mode}.`
   );
   await notify(
-    `🚀 Moniteur CESAL démarré (mode: ${config.mode}, intervalle ~${config.intervalSeconds}s, ` +
-      `nuit ~${config.nightIntervalSeconds}s).`
+    `🚀 Moniteur CESAL démarré (mode: ${config.mode}, intervalle ${config.intervalSeconds}s constant, jour et nuit).`
   );
 
   for (;;) {
@@ -113,13 +87,13 @@ async function loop() {
     }
 
     // ── Attente avant le prochain cycle ───────────────────────────────────
-    // En backoff : délai fixe = backoffS. Sinon : intervalle + jitter, moins
+    // En backoff : délai fixe = backoffS. Sinon : intervalle constant, moins
     // le temps déjà passé dans checkOnce (pour tenir la cadence réelle).
     let waitMs;
     if (backoffS) {
       waitMs = backoffS * 1000;
     } else {
-      waitMs = nextDelayMs(nightHours) - (Date.now() - start);
+      waitMs = nextDelayMs() - (Date.now() - start);
     }
     await new Promise((r) => setTimeout(r, Math.max(3_000, waitMs)));
   }
