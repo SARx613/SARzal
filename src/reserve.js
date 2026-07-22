@@ -135,6 +135,25 @@ async function readLogementsDisponibles(page) {
   return result;
 }
 
+/**
+ * Détermine si un logement est une COLOCATION (donc non auto-réservable).
+ *
+ * Le site EXIGE côté serveur l'email d'un/des colocataire(s) ayant déjà un
+ * compte Césal actif (cf. submit_reservation() → cesal_ajax_check_email.php :
+ * si numetu==0 → "Vous devez indiquer le colocataire n°X", validation refusée).
+ * Le bot ne peut donc PAS réserver seul un tel logement. On le détecte AVANT de
+ * cliquer "Valider" pour ne jamais lancer une validation vouée à l'échec.
+ *
+ * Deux signaux, l'un OU l'autre suffit :
+ *   - la colonne "Colocation ?" du tableau vaut "Oui" (champ `colocation`),
+ *   - le nombre d'occupants requis est > 1 (`nbOccupants`).
+ */
+function isColocation(l) {
+  const nb = parseInt(String(l.nbOccupants).replace(/\D/g, ''), 10);
+  if (Number.isFinite(nb) && nb > 1) return true;
+  return /\boui\b/i.test(l.colocation || '');
+}
+
 /** Formate les caractéristiques d'un logement en lignes lisibles pour Telegram. */
 function formatLogementDetails(l) {
   return [
@@ -431,6 +450,24 @@ export async function reserve(dispoResidences, _nodes, opts = {}) {
       return;
     }
 
+    // ── COLOCATION : non auto-réservable (le site exige l'email d'un
+    //    colocataire ayant un compte Césal actif — cf. isColocation). On ALERTE
+    //    fort avec tous les détails et on s'arrête AVANT toute tentative de
+    //    validation (qui échouerait de toute façon avec "colocataire n°2").
+    if (isColocation(chosen)) {
+      await notify(
+        `🚨🚨 <b>LOGEMENT DISPONIBLE — ACTION MANUELLE REQUISE</b> 🚨🚨\n\n` +
+        `📍 ${chemin}\n\n` +
+        `${details}\n\n` +
+        `👥 <b>C'est une COLOCATION</b> (${chosen.nbOccupants} occupants requis). ` +
+        `Le site EXIGE l'email d'un colocataire ayant déjà un compte Césal actif — ` +
+        `le bot NE PEUT PAS réserver seul.\n\n` +
+        `⚡️ <b>RÉSERVE TOI-MÊME MAINTENANT, TOUT DE SUITE :</b>\n🔗 ${URLS.reservation}`
+      );
+      await screenshot('COLOC', `Colocation détectée : ${chosen.code}`, { toTelegram: true });
+      return;
+    }
+
     // ── III/IV uniquement : cocher le toggle du logement → ouvre le formulaire
     //    "Votre réservation de logement" (#formulaire_voeu). D'après le JS du
     //    site, cocher ce toggle ne fait QU'AFFICHER le formulaire (display:block)
@@ -444,26 +481,90 @@ export async function reserve(dispoResidences, _nodes, opts = {}) {
     await dumpHtml('J'); // HTML exact du formulaire final, envoyé sur Telegram
 
     // ── III/IV : cliquer "Valider votre réservation" pour réserver réellement.
-    // submit_reservation() ouvre une popup jquery-confirm dont le bouton
-    // "Valider" soumet vraiment le formulaire.
+    // submit_reservation() (cf. HTML analysé) :
+    //   • s'il y a une erreur (colocataire manquant, date invalide…) → affiche
+    //     le div #submit_reservation_error et N'OUVRE PAS de popup ;
+    //   • sinon → ouvre une popup jquery-confirm dont le bouton "Valider"
+    //     soumet vraiment le formulaire (#action-validation_reservation).
+    // Pour une caution solidaire, la décision passe par un $.post AJAX
+    // (vérif des emails colocataires) → on attend soit l'erreur, soit la popup.
     const validerBtn = page.locator('[onclick*="submit_reservation"]').first();
     await validerBtn.waitFor({ state: 'visible', timeout: 5000 });
     await validerBtn.click();
-    await page.waitForTimeout(1000);
 
+    const errorBox = page.locator('#submit_reservation_error');
     const popupValider = page.locator('.jconfirm-buttons button:has-text("Valider")').first();
-    if (await popupValider.isVisible({ timeout: 3000 }).catch(() => false)) {
-      await popupValider.click();
+
+    // On attend le premier des deux : erreur visible OU popup de confirmation.
+    await Promise.race([
+      errorBox.waitFor({ state: 'visible', timeout: 8000 }).catch(() => {}),
+      popupValider.waitFor({ state: 'visible', timeout: 8000 }).catch(() => {}),
+    ]);
+
+    // Si une erreur bloquante s'est affichée, la réservation N'A PAS eu lieu :
+    // on lit le message exact du site et on rapporte l'ÉCHEC (pas de faux ✅).
+    if (await errorBox.isVisible().catch(() => false)) {
+      const rawMsg = await page
+        .locator('#submit_reservation_error_message')
+        .textContent()
+        .catch(() => '');
+      const reason = (rawMsg || '').replace(/\s+/g, ' ').trim() || 'raison inconnue';
+      await screenshot('K', `❌ Validation refusée : ${chosen.code}`, { toTelegram: true });
+      await notify(
+        `❌ <b>RÉSERVATION ÉCHOUÉE</b> — le site a refusé la validation.\n\n` +
+        `📍 ${chemin}\n${details}\n\n` +
+        `🛑 <b>Raison du site :</b> ${escapeHtml(reason)}\n\n` +
+        `⚡️ <b>Réserve à la main TOUT DE SUITE :</b>\n🔗 ${URLS.reservation}`
+      );
+      return;
     }
 
-    await page.waitForTimeout(2000);
-    await screenshot('K', 'Après "Valider votre réservation" — résultat final', { toTelegram: true });
+    // Pas d'erreur → popup de confirmation. On clique "Valider" pour soumettre.
+    if (await popupValider.isVisible().catch(() => false)) {
+      await popupValider.click();
+    } else {
+      // Ni erreur ni popup : état inattendu. On documente et on alerte sans
+      // prétendre que c'est confirmé.
+      await dumpHtml('K_INATTENDU');
+      await screenshot('K', `⚠️ État inattendu après Valider : ${chosen.code}`, { toTelegram: true });
+      await notify(
+        `⚠️ <b>Réservation — résultat INCERTAIN</b> (ni confirmation ni erreur détectée).\n\n` +
+        `📍 ${chemin}\n${details}\n\n` +
+        `👉 <b>VÉRIFIE ET/OU RÉSERVE À LA MAIN :</b>\n🔗 ${URLS.reservation}`
+      );
+      return;
+    }
+
+    // Le formulaire est soumis → la page recharge. On attend la nouvelle page et
+    // on lit le VRAI résultat au lieu d'annoncer un succès à l'aveugle.
+    await page.waitForLoadState('domcontentloaded').catch(() => {});
+    await page.waitForTimeout(2500);
+    await screenshot('K', 'Après validation — résultat final', { toTelegram: true });
+
+    // Après soumission réussie, la page "Mon logement" doit indiquer un bien
+    // réservé/en cours. Si le message "aucun bien en location ou réservé" est
+    // encore là (ou une erreur), la réservation n'a pas abouti.
+    const finalText = (await page.locator('body').textContent().catch(() => '')) || '';
+    const stillNothing = /aucun bien en location ou r.serv/i.test(finalText);
+    const errorAfter =
+      (await errorBox.isVisible().catch(() => false)) ||
+      /validation des informations impossible/i.test(finalText);
+
+    if (errorAfter || stillNothing) {
+      await dumpHtml('K_ECHEC');
+      await notify(
+        `❌ <b>RÉSERVATION NON CONFIRMÉE</b> après validation.\n\n` +
+        `📍 ${chemin}\n${details}\n\n` +
+        `👉 <b>RÉSERVE À LA MAIN TOUT DE SUITE :</b>\n🔗 ${URLS.reservation}`
+      );
+      return;
+    }
 
     await notify(
-      `✅ <b>Réservation tentée !</b>\n\n` +
+      `✅✅ <b>RÉSERVATION CONFIRMÉE !</b> 🎉\n\n` +
       `📍 ${chemin}\n\n` +
       `${details}\n\n` +
-      `⚠️ VÉRIFIE sur le site que la réservation est bien confirmée :\n${URLS.reservation}`
+      `🔗 Vérifie/complète ton dossier : ${URLS.reservation}`
     );
 
   } catch (err) {
