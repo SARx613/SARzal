@@ -164,6 +164,16 @@ export async function checkOnce() {
     return { error: err.message };
   }
 
+  // Rate-limiting / serveur en difficulté : on remonte l'info pour que la
+  // boucle applique un BACKOFF (et arrête de marteler). On respecte l'en-tête
+  // Retry-After si le serveur le fournit. Crucial à haute fréquence : un 429
+  // ignoré peut se transformer en blocage IP.
+  if (res.status === 429 || res.status === 503) {
+    const ra = parseInt(res.headers.get('retry-after') || '0', 10);
+    console.warn(`[check] Rate-limit CESAL (HTTP ${res.status})${ra ? `, Retry-After=${ra}s` : ''}.`);
+    return { error: 'RATE_LIMITED', status: res.status, retryAfter: Number.isFinite(ra) && ra > 0 ? ra : 0 };
+  }
+
   // Redirection vers le login => session expirée.
   if (res.status >= 300 && res.status < 400) {
     const loc = res.headers.get('location') || '';
@@ -294,9 +304,18 @@ export async function checkOnce() {
     return { available: true, autoReserved: isEligible, nodes };
   }
 
-  console.log(`[check] ${new Date().toLocaleTimeString()} — aucune dispo (${Object.keys(nodes).length} noeuds vérifiés).`);
+  // À haute fréquence, on ne loggue "aucune dispo" qu'une fois toutes les
+  // ~5 min pour ne pas noyer les logs Fly (sinon des milliers de lignes/jour).
+  const now = Date.now();
+  if (now - lastNoDispoLog > 5 * 60_000) {
+    console.log(`[check] ${new Date().toLocaleTimeString()} — aucune dispo (${Object.keys(nodes).length} noeuds vérifiés).`);
+    lastNoDispoLog = now;
+  }
   return { available: false, nodes };
 }
+
+// Horodatage du dernier log "aucune dispo" (throttling du bruit de logs).
+let lastNoDispoLog = 0;
 
 if (import.meta.url === `file://${process.argv[1]}`) {
   checkOnce().then((r) => process.exit(r?.error ? 1 : 0));
