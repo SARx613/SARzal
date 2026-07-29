@@ -8,12 +8,12 @@ const HEARTBEAT_MS = 6 * 60 * 60_000; // toutes les 6h : "je suis toujours en vi
  * Délai (ms) avant le prochain check. Intervalle identique jour et nuit (pas de
  * ralentissement nocturne) + jitter aléatoire ±jitterSeconds pour ne PAS taper
  * à une périodicité robotique parfaite (garde-fou anti-détection). Plancher de
- * sécurité : jamais < 3s.
+ * sécurité : jamais < 1s.
  */
 function nextDelayMs() {
   const jitter = config.jitterSeconds;
   const deltaS = jitter > 0 ? (Math.random() * 2 - 1) * jitter : 0;
-  const s = Math.max(3, config.intervalSeconds + deltaS);
+  const s = Math.max(1, config.intervalSeconds + deltaS);
   return Math.round(s * 1000);
 }
 
@@ -99,7 +99,7 @@ async function loop() {
     } else {
       waitMs = nextDelayMs() - (Date.now() - start);
     }
-    await new Promise((r) => setTimeout(r, Math.max(3_000, waitMs)));
+    await new Promise((r) => setTimeout(r, Math.max(1_000, waitMs)));
   }
 }
 
