@@ -25,6 +25,41 @@ const LABELS = {
   residence_6: 'Résidence Le Mail',
 };
 
+// ── Anti-spam "session expirée" ─────────────────────────────────────────────
+// Tant que la session n'est pas renouvelée (npm run login), CHAQUE cycle
+// retombe sur la même erreur → sans garde-fou, ça enverrait un message
+// Telegram toutes les intervalSeconds (ex: 15/3s), soit des centaines de
+// notifs par nuit si on oublie de se reconnecter avant de dormir. On coupe
+// donc l'envoi après SESSION_ALERT_LIMIT alertes consécutives ; le moniteur
+// continue de tourner en silence (logs uniquement) et redevient bavard dès
+// qu'un check réussit (= nouveau login détecté).
+const SESSION_ALERT_LIMIT = 10;
+let sessionAlertCount = 0;
+
+async function notifySessionIssue(text) {
+  sessionAlertCount++;
+  if (sessionAlertCount > SESSION_ALERT_LIMIT) {
+    console.warn(`[check] Session toujours invalide (alerte #${sessionAlertCount}) — notif Telegram coupée après ${SESSION_ALERT_LIMIT}, reconnecte-toi (npm run login).`);
+    return;
+  }
+  if (sessionAlertCount === SESSION_ALERT_LIMIT) {
+    await notify(
+      `${text}\n\n🔇 <b>C'était l'alerte n°${SESSION_ALERT_LIMIT}</b> — je me tais maintenant pour ne pas te spammer. ` +
+      `Je surveille toujours en silence et je redeviendrai bavard dès que tu te reconnectes.`
+    );
+    return;
+  }
+  await notify(text);
+}
+
+/** Réinitialise le compteur d'alertes dès qu'un check réussit (session valide). */
+function resetSessionAlertCount() {
+  if (sessionAlertCount > 0) {
+    console.log('[check] Session de nouveau valide — compteur d\'alertes remis à zéro.');
+  }
+  sessionAlertCount = 0;
+}
+
 /** Lit le cookie de session capturé par Playwright (config/session.json). */
 function loadCookieHeader() {
   if (!fs.existsSync(STORAGE_STATE)) return null;
@@ -90,6 +125,43 @@ const AUTO_RESERVE_RESIDENCE_IDS = new Set(['residence_3', 'residence_4']);
  *      ↳ Aile A — 2 logements disponibles
  *         ↳ Niveau R+1 — 2 logements disponibles
  */
+/**
+ * Construit un libellé de chemin lisible "Résidence III › Aile E › Escalier C ›
+ * Niveau R+2" pour une résidence donnée, à partir du 1er nœud dispo à chaque
+ * niveau (batiment → cage → niveau). Purement cosmétique (les vrais détails du
+ * logement viennent du tableau tr_logement_*). Renvoie au minimum le libellé de
+ * la résidence si les sous-niveaux ne sont pas identifiables.
+ */
+function buildChemin(res, nodes) {
+  const resNum = res.id.replace('residence_', '');
+  const parts = [res.label];
+
+  const aile = Object.entries(nodes).find(
+    ([id, v]) => v.available && new RegExp(`^batiment_${resNum}_[A-Z]$`).test(id)
+  );
+  if (aile) {
+    const aileNum = aile[0].split('_')[2];
+    parts.push(`Aile ${aileNum}`);
+
+    const cage = Object.entries(nodes).find(
+      ([id, v]) => v.available && id.startsWith(`cage_${resNum}_${aileNum}_`)
+    );
+    if (cage) {
+      const cageIdx = cage[0].split('_')[3];
+      parts.push(`Escalier ${cageIdx}`);
+
+      const niveau = Object.entries(nodes).find(
+        ([id, v]) => v.available && id.startsWith(`niveau_${resNum}_${aileNum}_${cageIdx}_`)
+      );
+      if (niveau) {
+        const nivNum = niveau[0].split('_')[4];
+        parts.push(`Niveau R+${nivNum}`);
+      }
+    }
+  }
+  return parts.join(' › ');
+}
+
 function buildDispoMessage(dispoResidences, nodes) {
   const lines = [];
   for (const res of dispoResidences) {
@@ -149,7 +221,7 @@ async function fetchReservationPage(cookieHeader, dateArrivee) {
 export async function checkOnce() {
   const cookieHeader = loadCookieHeader();
   if (!cookieHeader) {
-    await notify(
+    await notifySessionIssue(
       '⚠️ Pas de session CESAL. Lance <code>npm run login</code> pour te connecter une fois (résous le captcha).'
     );
     return { error: 'NO_SESSION' };
@@ -178,7 +250,7 @@ export async function checkOnce() {
   if (res.status >= 300 && res.status < 400) {
     const loc = res.headers.get('location') || '';
     if (/login/i.test(loc)) {
-      await notify('🔐 Session CESAL expirée. Relance <code>npm run login</code>.');
+      await notifySessionIssue('🔐 Session CESAL expirée. Relance <code>npm run login</code>.');
       return { error: 'SESSION_EXPIRED' };
     }
   }
@@ -187,9 +259,12 @@ export async function checkOnce() {
 
   // Page de login renvoyée directement (autre forme d'expiration).
   if (/g-recaptcha|name="login-email"/.test(html) && !/id="residences"/.test(html)) {
-    await notify('🔐 Session CESAL expirée. Relance <code>npm run login</code>.');
+    await notifySessionIssue('🔐 Session CESAL expirée. Relance <code>npm run login</code>.');
     return { error: 'SESSION_EXPIRED' };
   }
+
+  // Session valide (on a dépassé toutes les détections d'expiration ci-dessus).
+  resetSessionAlertCount();
 
   // On scanne sur la DERNIÈRE date d'arrivée disponible (comportement choisi).
   // Si la réponse n'est pas déjà sur cette date, on refait l'appel avec elle.
@@ -275,30 +350,22 @@ export async function checkOnce() {
       );
     }
 
-    // On lance Playwright dans TOUS les cas, mais commit=true seulement pour
-    // III/IV. Pour les autres, on navigue juste pour lire les détails du
-    // logement. Nécessite le mode reserve (sinon pas d'ouverture de navigateur).
+    // ── RÉSERVATION 100 % HTTP (aucun navigateur) ────────────────────────────
+    // Tout le détail des logements ET le formulaire de validation sont DÉJÀ dans
+    // le `html` qu'on vient de récupérer (le parcours du site est 100 % côté
+    // client — cf. reserve-http.js). On traite donc chaque résidence cible en
+    // quelques millisecondes, sans ouvrir Chromium. commit=true seulement pour
+    // III/IV (validation réelle) ; les autres → détails seuls.
+    // Nécessite le mode reserve (sinon on se contente de l'alerte ci-dessus).
     if (config.mode === 'reserve') {
-      // La réservation (Playwright) est protégée par un TIMEOUT GLOBAL DUR : si
-      // elle se bloque (ex. Chromium qui gèle), on abandonne au bout de 3 min et
-      // on RENDS LA MAIN à la surveillance — elle ne doit jamais mourir en silence.
-      // On traite chaque résidence cible SÉPARÉMENT (un appel reserve() par
-      // résidence, donc un navigateur par résidence) : si III et IV sont dispo
-      // en même temps, on ne veut pas ignorer l'une des deux pour ne traiter
-      // que la première du tableau.
-      const RESERVE_TIMEOUT_MS = 3 * 60_000;
-      const { reserve } = await import('./reserve.js');
+      const { handleAvailability } = await import('./reserve-http.js');
       for (const res of targetResidences) {
+        const chemin = buildChemin(res, nodes);
         try {
-          await Promise.race([
-            reserve([res], nodes, { commit: isEligible }),
-            new Promise((_, rej) =>
-              setTimeout(() => rej(new Error('RESERVE_TIMEOUT (>3min, abandon)')), RESERVE_TIMEOUT_MS)
-            ),
-          ]);
+          await handleAvailability(html, cookieHeader, chemin, { commit: isEligible });
         } catch (err) {
           await notify(
-            `⚠️ ${isEligible ? 'Réservation auto' : 'Captures'} (${res.label}) en échec : <code>${escapeHtml(err.message)}</code>\n` +
+            `⚠️ Traitement (${res.label}) en échec : <code>${escapeHtml(err.message)}</code>\n` +
             `👉 Réserve à la main si besoin : ${URLS.reservation}`
           );
         }

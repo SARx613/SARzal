@@ -12,12 +12,12 @@ export const config = {
 
   // ── Surveillance rapide (fetch HTTP pur, pas de navigateur permanent) ──────
   // Intervalle de base entre deux checks, en SECONDES — identique jour et nuit
-  // (pas de ralentissement nocturne). Défaut 25s ; ajustable via le secret Fly
+  // (pas de ralentissement nocturne). Défaut 3s ; ajustable via le secret Fly
   // INTERVAL_SECONDS sans redéployer. Si INTERVAL_SECONDS n'est pas défini mais
   // INTERVAL_MINUTES l'est, on retombe sur les minutes (rétro-compatible).
   intervalSeconds: parseInt(
     process.env.INTERVAL_SECONDS ||
-      String((parseInt(process.env.INTERVAL_MINUTES || '0', 10) || 0) * 60 || 25),
+      String((parseInt(process.env.INTERVAL_MINUTES || '0', 10) || 0) * 60 || 3),
     10
   ),
   // Jitter : on ajoute ±jitterSeconds aléatoires à chaque cycle pour NE PAS
