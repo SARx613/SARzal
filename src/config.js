@@ -22,7 +22,8 @@ export const config = {
   ),
   // Jitter : on ajoute ±jitterSeconds aléatoires à chaque cycle pour NE PAS
   // taper à une périodicité robotique parfaite (garde-fou anti-détection).
-  jitterSeconds: parseInt(process.env.JITTER_SECONDS || '4', 10),
+  // parseFloat (pas parseInt) car la valeur peut être décimale (ex: 1.5).
+  jitterSeconds: parseFloat(process.env.JITTER_SECONDS || '1.5'),
   // Plafond du backoff exponentiel appliqué sur 429/5xx/erreur réseau.
   maxBackoffSeconds: parseInt(process.env.MAX_BACKOFF_SECONDS || '300', 10),
 };
