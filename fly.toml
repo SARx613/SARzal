@@ -1,18 +1,24 @@
-app = 'sarzal'
+# fly.toml app configuration file generated for sarzal-crfugg on 2026-08-01T21:59:58Z
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'sarzal-crfugg'
 primary_region = 'ams'
 
 [build]
 
-# Aucun [http_service] ni [[services]] = worker pur, pas de port exposé
-# La commande de démarrage est définie dans le Dockerfile (CMD ["sh", "start.sh"])
-
 [processes]
-  app = "sh start.sh"
+  app = 'sh start.sh'
+
+[http_service]
+  internal_port = 3000
+  force_https = true
+  auto_stop_machines = 'stop'
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ['app']
 
 [[vm]]
   size = 'shared-cpu-1x'
-  memory = '1024mb'  # 512 était encore trop juste : dmesg montrait Chromium
-  # refuser une allocation de 512MB d'un coup (__vm_enough_memory), ce qui
-  # bloquait silencieusement le network service interne (page.goto() qui ne
-  # résout jamais, sans erreur). 256→512 ne suffisait qu'à lancer Chromium,
-  # pas à le faire NAVIGUER en même temps que le monitoring tourne.
+  memory = '1024mb'
