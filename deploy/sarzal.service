@@ -1,0 +1,41 @@
+[Unit]
+Description=Moniteur logements CESAL (SARzal)
+Documentation=https://github.com/SARx613/SARzal
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sarzal
+WorkingDirectory=/opt/sarzal
+
+# Secrets (équivalent des `fly secrets`). Le `-` rend le démarrage tolérant si
+# le fichier n'existe pas encore.
+EnvironmentFile=-/etc/sarzal.env
+
+# start.sh décode SESSION_JSON_B64 vers config/session.json puis exec node.
+ExecStart=/bin/sh /opt/sarzal/start.sh
+
+# Redémarrage automatique : c'est ce qui remplace le superviseur Fly. Le
+# moniteur doit tourner 24/7 ; s'il crashe, on relance 10 s plus tard, sans
+# limite de tentatives (StartLimitIntervalSec=0).
+Restart=always
+RestartSec=10
+StartLimitIntervalSec=0
+
+# Garde-fou mémoire : e2-micro n'a qu'1 Go. Au-delà de 900 Mo le service est
+# tué puis relancé proprement, plutôt que de faire ramer toute la VM.
+MemoryMax=900M
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sarzal
+
+# Durcissement de base
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
