@@ -52,7 +52,20 @@ Quand la session expire, le bot t'envoie une alerte Telegram → relance `npm ru
   car interactive (select2 + datepicker + cases à cocher). **Échafaudée mais pas
   encore testée contre une vraie dispo** → garde `MODE=alert` jusqu'à validation.
 
-## Hébergement 24/7 (à décider)
+## Hébergement 24/7
 
-Le moniteur HTTP tourne partout : ton Mac (`npm start`), GitHub Actions (cron
-~5 min, stocker le cookie en secret), Render, etc. À choisir une fois testé.
+**Google Cloud — VM Compute Engine `e2-micro` (Always Free)** : c'est le
+remplaçant de Fly.io, gratuit à vie. Guide pas-à-pas complet :
+**[docs/DEPLOY-GCP.md](docs/DEPLOY-GCP.md)**.
+
+En résumé : une VM Debian en zone US (`us-central1`), `deploy/bootstrap-gcp.sh`
+installe tout (Node 20, Chromium, swap 2 Go, service systemd qui redémarre au
+boot et après un crash), puis on pilote depuis le Mac avec `make logs-gcp`,
+`make relogin-gcp`, `make deploy-gcp`.
+
+⚠️ Cloud Run / Cloud Functions ne conviennent **pas** : le moniteur est un
+worker permanent, pas un service qui répond à des requêtes — le maintenir
+éveillé (`min-instances=1`) est facturé.
+
+Le moniteur HTTP reste par ailleurs exécutable partout : ton Mac (`npm start`),
+GitHub Actions (cron, cookie en secret), Render, etc.
