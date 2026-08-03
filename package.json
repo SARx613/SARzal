@@ -6,7 +6,8 @@
   "scripts": {
     "login": "node src/login.js",
     "check": "node src/monitor.js",
-    "start": "node src/loop.js"
+    "start": "node src/loop.js",
+    "test:selection": "node src/test-selection.js"
   },
   "keywords": [],
   "author": "",

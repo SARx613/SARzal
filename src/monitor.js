@@ -1,5 +1,5 @@
 import fs from 'fs';
-import { config, URLS, STORAGE_STATE } from './config.js';
+import { config, URLS, STORAGE_STATE, RESIDENCE_LABELS, residenceLabel } from './config.js';
 import { notify, escapeHtml } from './notify.js';
 
 /**
@@ -16,14 +16,9 @@ import { notify, escapeHtml } from './notify.js';
  *   du cookie une fois, captcha résolu à la main) et à la réservation finale.
  */
 
-const LABELS = {
-  residence_1: 'Résidence I',
-  residence_2: 'Résidence II',
-  residence_3: 'Résidence III',
-  residence_4: 'Résidence IV',
-  residence_5: 'Résidence Joliot-Curie',
-  residence_6: 'Résidence Le Mail',
-};
+const LABELS = Object.fromEntries(
+  Object.entries(RESIDENCE_LABELS).map(([num, label]) => [`residence_${num}`, label])
+);
 
 // ── Anti-spam "session expirée" ─────────────────────────────────────────────
 // Tant que la session n'est pas renouvelée (npm run login), CHAQUE cycle
@@ -115,9 +110,13 @@ function availableResidences(nodes) {
 
 /**
  * Résidences pour lesquelles on AUTO-RÉSERVE (les autres → notification seule).
- * Choix utilisateur : uniquement Résidence III et Résidence IV.
+ * Choix utilisateur par défaut : Résidence III et Résidence IV. Pilotable par
+ * le secret Fly AUTO_RESERVE_RESIDENCES (ex "3,4") sans redéployer.
  */
-const AUTO_RESERVE_RESIDENCE_IDS = new Set(['residence_3', 'residence_4']);
+const AUTO_RESERVE_RESIDENCE_IDS = new Set(
+  config.autoReserveResidences.map((n) => `residence_${n}`)
+);
+const AUTO_RESERVE_LABELS = config.autoReserveResidences.map((n) => residenceLabel(n)).join(' / ');
 
 /**
  * Construit le texte de notification hiérarchisé :
@@ -125,43 +124,6 @@ const AUTO_RESERVE_RESIDENCE_IDS = new Set(['residence_3', 'residence_4']);
  *      ↳ Aile A — 2 logements disponibles
  *         ↳ Niveau R+1 — 2 logements disponibles
  */
-/**
- * Construit un libellé de chemin lisible "Résidence III › Aile E › Escalier C ›
- * Niveau R+2" pour une résidence donnée, à partir du 1er nœud dispo à chaque
- * niveau (batiment → cage → niveau). Purement cosmétique (les vrais détails du
- * logement viennent du tableau tr_logement_*). Renvoie au minimum le libellé de
- * la résidence si les sous-niveaux ne sont pas identifiables.
- */
-function buildChemin(res, nodes) {
-  const resNum = res.id.replace('residence_', '');
-  const parts = [res.label];
-
-  const aile = Object.entries(nodes).find(
-    ([id, v]) => v.available && new RegExp(`^batiment_${resNum}_[A-Z]$`).test(id)
-  );
-  if (aile) {
-    const aileNum = aile[0].split('_')[2];
-    parts.push(`Aile ${aileNum}`);
-
-    const cage = Object.entries(nodes).find(
-      ([id, v]) => v.available && id.startsWith(`cage_${resNum}_${aileNum}_`)
-    );
-    if (cage) {
-      const cageIdx = cage[0].split('_')[3];
-      parts.push(`Escalier ${cageIdx}`);
-
-      const niveau = Object.entries(nodes).find(
-        ([id, v]) => v.available && id.startsWith(`niveau_${resNum}_${aileNum}_${cageIdx}_`)
-      );
-      if (niveau) {
-        const nivNum = niveau[0].split('_')[4];
-        parts.push(`Niveau R+${nivNum}`);
-      }
-    }
-  }
-  return parts.join(' › ');
-}
-
 function buildDispoMessage(dispoResidences, nodes) {
   const lines = [];
   for (const res of dispoResidences) {
@@ -316,25 +278,22 @@ export async function checkOnce() {
     }
     markSignatureSeen(signature);
 
-    // On ne RÉSERVE réellement que pour les Résidences III / IV. Pour les autres,
-    // on ouvre quand même le navigateur pour prendre les captures (documentation),
-    // mais sans jamais cliquer "Réserver"/"Valider" (commit=false).
+    // On ne VALIDE réellement que si une résidence auto-réservable (III/IV par
+    // défaut) est dans le lot. Sinon on récupère quand même tous les détails des
+    // logements pour la notification, sans jamais valider (commit=false).
     const autoResidences = dispoResidences.filter((r) =>
       AUTO_RESERVE_RESIDENCE_IDS.has(r.id)
     );
     const isEligible = autoResidences.length > 0;
-    // Résidences vers lesquelles diriger la navigation : III/IV en priorité,
-    // sinon la 1re dispo (pour les captures uniquement).
-    const targetResidences = isEligible ? autoResidences : dispoResidences;
 
     // Message d'alerte — différent selon qu'on va réserver ou juste documenter.
     if (isEligible) {
       await notify(
         `🏠 <b>LOGEMENT DISPONIBLE CHEZ CESAL !</b>\n\n` +
         buildDispoMessage(dispoResidences, nodes) +
-        `\n\n🎯 <b>Résidence III/IV détectée → le bot analyse le logement.</b>` +
-        `\n   • Logement individuel → il réserve automatiquement.` +
-        `\n   • Colocation (email colocataire exigé par le site) → il NE PEUT PAS,` +
+        `\n\n🎯 <b>${AUTO_RESERVE_LABELS} détectée → le bot analyse les logements.</b>` +
+        `\n   • Il choisit le meilleur selon tes préférences (${config.preferredTypes.join(' > ')}, sans colocation) et le réserve.` +
+        `\n   • Colocation solidaire (email colocataire exigé par le site) → il NE PEUT PAS,` +
         ` il t'alerte pour que tu réserves à la main.` +
         `\n⚡ <b>EN BACKUP, réserve TOI AUSSI à la main tout de suite :</b>` +
         `\n🔗 ${URLS.reservation}`
@@ -343,7 +302,7 @@ export async function checkOnce() {
       await notify(
         `🏠 <b>LOGEMENT DISPONIBLE CHEZ CESAL !</b>\n\n` +
         buildDispoMessage(dispoResidences, nodes) +
-        `\n\nℹ️ <b>Ce n'est PAS une Résidence III/IV</b> → je ne réserve PAS,` +
+        `\n\nℹ️ <b>Ce n'est PAS une ${AUTO_RESERVE_LABELS}</b> → je ne réserve PAS,` +
         ` je récupère juste les détails du logement (prix, surface, colocation…).` +
         `\n👉 Si ça t'intéresse, réserve à la main :` +
         `\n🔗 ${URLS.reservation}`
@@ -353,22 +312,22 @@ export async function checkOnce() {
     // ── RÉSERVATION 100 % HTTP (aucun navigateur) ────────────────────────────
     // Tout le détail des logements ET le formulaire de validation sont DÉJÀ dans
     // le `html` qu'on vient de récupérer (le parcours du site est 100 % côté
-    // client — cf. reserve-http.js). On traite donc chaque résidence cible en
-    // quelques millisecondes, sans ouvrir Chromium. commit=true seulement pour
-    // III/IV (validation réelle) ; les autres → détails seuls.
+    // client — cf. reserve-http.js). UN SEUL appel, même si plusieurs résidences
+    // sont dispos : le HTML les contient toutes, et c'est reserve-http.js qui
+    // rattache chaque logement à SA résidence puis choisit le meilleur selon les
+    // préférences. commit=true seulement si une résidence auto-réservable est
+    // dans le lot ; sinon → détails seuls.
     // Nécessite le mode reserve (sinon on se contente de l'alerte ci-dessus).
     if (config.mode === 'reserve') {
       const { handleAvailability } = await import('./reserve-http.js');
-      for (const res of targetResidences) {
-        const chemin = buildChemin(res, nodes);
-        try {
-          await handleAvailability(html, cookieHeader, chemin, { commit: isEligible });
-        } catch (err) {
-          await notify(
-            `⚠️ Traitement (${res.label}) en échec : <code>${escapeHtml(err.message)}</code>\n` +
-            `👉 Réserve à la main si besoin : ${URLS.reservation}`
-          );
-        }
+      const contexte = dispoResidences.map((r) => r.label).join(', ');
+      try {
+        await handleAvailability(html, cookieHeader, { contexte, commit: isEligible });
+      } catch (err) {
+        await notify(
+          `⚠️ Traitement de la dispo (${contexte}) en échec : <code>${escapeHtml(err.message)}</code>\n` +
+          `👉 Réserve à la main si besoin : ${URLS.reservation}`
+        );
       }
     }
     return { available: true, autoReserved: isEligible, nodes };

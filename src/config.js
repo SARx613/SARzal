@@ -26,7 +26,55 @@ export const config = {
   jitterSeconds: parseFloat(process.env.JITTER_SECONDS || '1.5'),
   // Plafond du backoff exponentiel appliqué sur 429/5xx/erreur réseau.
   maxBackoffSeconds: parseInt(process.env.MAX_BACKOFF_SECONDS || '300', 10),
+
+  // ── Sélection du logement à auto-réserver ────────────────────────────────
+  // Quand PLUSIEURS logements sont dispos en même temps (cas réel attendu),
+  // il faut choisir. Tout est pilotable par secret Fly, sans redéployer.
+
+  // Résidences pour lesquelles on VALIDE réellement (les autres = alerte seule).
+  // Ex: "3,4". L'ordre compte : sert de départage à qualité égale.
+  autoReserveResidences: (process.env.AUTO_RESERVE_RESIDENCES || '3,4')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean),
+
+  // Ordre de PRÉFÉRENCE des types de logement (le 1er = le rêve).
+  // Comparaison insensible à la casse/espaces ("t1 bis" == "T1 BIS").
+  preferredTypes: (process.env.PREFERRED_TYPES || 'T1,T1 BIS,T2')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean),
+
+  // true → on ne réserve QUE les types listés ci-dessus (un type inconnu est
+  // signalé mais jamais validé). false (défaut) → les autres types restent
+  // réservables, mais toujours APRÈS les préférés (filet de sécurité : mieux
+  // vaut un logement en III/IV que rien).
+  strictTypes: process.env.STRICT_TYPES === 'true',
+
+  // Autoriser l'auto-réservation d'une colocation NON solidaire (le site ne
+  // demande alors aucun email de colocataire — cf. submit_reservation()).
+  // Défaut false : tu veux du sans-colocation. Ces logements restent notifiés.
+  allowColocNonSolidaire: process.env.ALLOW_COLOC_NON_SOLIDAIRE === 'true',
+
+  // Nombre max de logements différents tentés dans un même cycle si les
+  // premiers échouent (garde-fou : on ne martèle pas le serveur).
+  maxReserveAttempts: parseInt(process.env.MAX_RESERVE_ATTEMPTS || '3', 10),
 };
+
+/** Libellés lisibles des résidences (partagés monitor / reserve). */
+export const RESIDENCE_LABELS = {
+  1: 'Résidence I',
+  2: 'Résidence II',
+  3: 'Résidence III',
+  4: 'Résidence IV',
+  5: 'Résidence Joliot-Curie',
+  6: 'Résidence Le Mail',
+};
+
+/** "3" → "Résidence III" (repli : "Résidence 7" si numéro inconnu). */
+export function residenceLabel(num) {
+  return RESIDENCE_LABELS[num] || `Résidence ${num}`;
+}
 
 export const URLS = {
   login: 'https://logement.cesal.fr/espace-resident/cesal_login.php',
