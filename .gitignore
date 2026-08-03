@@ -6,6 +6,7 @@ config/seen_logements.json
 config/step_*.html
 config/reserve_step_*.html
 config/reserve_debug_*.html
+config/reserve_http_*.html
 config/last_response.html
 config/*.png
 config/fetch_live.js

@@ -1,10 +1,19 @@
-app = 'sarzal'
+app = 'sarzal-crfugg'
 primary_region = 'ams'
 
 [build]
 
 # Aucun [http_service] ni [[services]] = worker pur, pas de port exposé
 # La commande de démarrage est définie dans le Dockerfile (CMD ["sh", "start.sh"])
+#
+# ⚠️ AUTOSTOP : fly-proxy juge l'activité d'une machine au trafic HTTP entrant.
+# Ce worker n'en reçoit jamais → le proxy le considère "excess capacity" et
+# l'éteint (vu le 2026-08-01 : "0 out of 1 machines left running").
+# Le fix n'est PAS dans ce fichier : il faut supprimer le service fantôme
+# (internal_port 3000) resté dans la config stockée côté Fly, puis :
+#   flyctl scale count 1        # une seule instance (worker, pas de HA)
+#   flyctl machine update <id> --autostop=off --autostart=false
+# Vérifier ensuite avec `flyctl status` que la machine reste "started".
 
 [processes]
   app = "sh start.sh"
