@@ -1,6 +1,24 @@
-import { config } from './config.js';
+import { config, residenceLabel } from './config.js';
 import { checkOnce } from './monitor.js';
 import { notify } from './notify.js';
+
+/**
+ * Résumé des règles de sélection actives — affiché au démarrage (logs Fly ET
+ * Telegram). Quand plusieurs logements tombent en même temps, c'est ce qui
+ * décide lequel sera réservé de façon IRRÉVERSIBLE : autant pouvoir le vérifier
+ * d'un coup d'œil, sans relire le code ni la liste des secrets.
+ */
+function resumeReglesSelection() {
+  const residences = config.autoReserveResidences.map((n) => residenceLabel(n)).join(' puis ');
+  return [
+    `🏘️ Réserve dans : ${residences || '(aucune)'}`,
+    `🏷️ Types par ordre de préférence : ${config.preferredTypes.join(' > ')}` +
+      (config.strictTypes ? ' (STRICT : rien d\'autre)' : ' (les autres types en dernier recours)'),
+    `👥 Colocation : ${config.allowColocNonSolidaire ? 'non solidaire acceptée' : 'jamais'}` +
+      ` (solidaire = toujours refusée par le site)`,
+    `🔁 Jusqu'à ${config.maxReserveAttempts} logement(s) tenté(s) si le site refuse le 1er choix`,
+  ].join('\n');
+}
 
 const HEARTBEAT_MS = 6 * 60 * 60_000; // toutes les 6h : "je suis toujours en vie"
 
@@ -33,11 +51,14 @@ async function loop() {
   let lastHeartbeat = 0;
   let backoffS = 0; // 0 = pas de backoff en cours
 
+  const regles = resumeReglesSelection();
   console.log(
     `Moniteur CESAL démarré — check ~${config.intervalSeconds}s (±${config.jitterSeconds}s, jour et nuit), mode: ${config.mode}.`
   );
+  console.log(regles);
   await notify(
-    `🚀 Moniteur CESAL démarré (mode: ${config.mode}, intervalle ~${config.intervalSeconds}s ±${config.jitterSeconds}s, jour et nuit).`
+    `🚀 Moniteur CESAL démarré (mode: ${config.mode}, intervalle ~${config.intervalSeconds}s ±${config.jitterSeconds}s, jour et nuit).` +
+      (config.mode === 'reserve' ? `\n\n<b>Règles de choix en cas de dispos multiples :</b>\n${regles}` : '')
   );
 
   for (;;) {
