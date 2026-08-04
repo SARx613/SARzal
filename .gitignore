@@ -1,12 +1,7 @@
 node_modules/
 .env
 .DS_Store
-config/session.json
-config/seen_logements.json
-config/step_*.html
-config/reserve_step_*.html
-config/reserve_debug_*.html
-config/last_response.html
-config/*.png
-config/fetch_live.js
+# Tout config/ est du runtime : session, état quotidien, dumps HTML de debug.
+# (Le dossier est recréé par le Dockerfile et par le code au besoin.)
+config/
 *.har
