@@ -130,6 +130,32 @@ make run-warm     # fenêtre visible, préchauffée, checks toutes les 3 s
 Le coût de démarrage (~6 s) est payé **une seule fois**, au lancement du bot, et
 en tâche de fond : le premier check n'attend pas la fenêtre.
 
+### Est-ce que je peux continuer à bosser pendant ce temps ?
+
+**Oui.** Le bot n'ouvre pas une fenêtre de *ton* Chrome : Playwright lance une
+application séparée, **« Google Chrome for Testing »** (icône distincte dans le
+Dock, processus distincts, profil distinct). Ton Google Chrome n'est pas touché
+— vérifié : même PID avant, pendant et après.
+
+Concrètement, tout ceci est sans risque et a été testé sur cette machine :
+
+| Ce que tu fais | Effet sur le bot |
+|---|---|
+| Bosser dans ton Chrome, ton éditeur, une autre app | aucun (clic en 62 ms, ton Chrome au premier plan) |
+| Masquer complètement la fenêtre du bot | aucun (clic en 68 ms derrière le Finder) |
+| Ouvrir d'autres fenêtres / onglets ailleurs | aucun |
+
+Playwright pilote la page par le protocole de debug, pas par la souris de l'OS :
+la fenêtre n'a jamais besoin d'être visible ni au premier plan.
+
+⚠️ **La seule chose à ne pas faire** : naviguer *dans l'onglet du bot* pendant
+qu'il réserve. Ça casse net son parcours (vérifié : le clic suivant part en
+timeout). Cet onglet est donc marqué en rouge « 🤖 BOT — NE PAS TOUCHER » et son
+titre l'indique. Laisse-le tranquille et travaille dans ton Chrome habituel.
+
+Si tu préfères ne pas voir cette fenêtre du tout : `make run-warm-headless`,
+même gain de temps, aucune fenêtre à l'écran.
+
 Les autres cibles :
 
 ```bash
