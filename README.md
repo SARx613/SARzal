@@ -34,7 +34,7 @@ cp .env.example .env   # puis remplis Telegram + mot de passe
 ```bash
 npm run login    # ouvre un navigateur : connecte-toi (résous le captcha) UNE fois
 npm run check    # un seul check (utile pour debug)
-npm start        # boucle : check toutes les INTERVAL_MINUTES
+npm start        # boucle : check toutes les INTERVAL_SECONDS (3 s)
 npm test         # tests hors-ligne (parseurs + flux de réservation complet)
 npm run diagnostic  # vérifie la chaîne complète sur le VRAI site, sans rien réserver
 ```
@@ -107,6 +107,50 @@ Autres correctifs issus du même audit :
   chaque redéploiement ;
 - si la page CESAL devient illisible (structure changée), le bot le **dit** au
   lieu de surveiller dans le vide.
+
+## Tourner en local EN PLUS du VPS
+
+Le VPS tourne 24/7, mais il réserve « à froid » : Chromium n'est lancé qu'au
+moment où un logement sort. Mesuré contre le vrai site, arriver jusqu'à une page
+de réservation utilisable coûte **~2,8 s** — payées exactement au pire moment.
+
+En local, on peut faire mieux : garder une fenêtre **déjà ouverte, déjà
+connectée et déjà posée sur la page de réservation**. La surveillance reste en
+HTTP pur (inchangée) ; seule la réservation démarre à chaud.
+
+```bash
+nvm use 22        # obligatoire : le node par défaut est un v14, sans fetch
+make run-warm     # fenêtre visible, préchauffée, checks toutes les 3 s
+```
+
+| | à froid (VPS) | fenêtre chaude (Mac) |
+|---|---|---|
+| Avant de pouvoir agir | ~2800 ms | **~14 ms** |
+
+Le coût de démarrage (~6 s) est payé **une seule fois**, au lancement du bot, et
+en tâche de fond : le premier check n'attend pas la fenêtre.
+
+Les autres cibles :
+
+```bash
+make run-warm-headless  # même gain, mais sans fenêtre visible à l'écran
+make run-visible        # fenêtre visible, sans préchauffage
+make run-alert          # notifie seulement, ne réserve jamais
+make all                # lance l'instance locale en arrière-plan
+make logs-local         # suit ses logs
+make stop-local         # l'arrête (sans toucher au VPS)
+```
+
+Chaque message Telegram est préfixé par `INSTANCE_NAME` (`[Mac-chaud]`, …) :
+avec deux instances dans le même chat, c'est ce qui te dit laquelle a parlé.
+
+⚠️ **Le Mac et le VPS peuvent tenter de réserver le même logement** : ils ne
+partagent pas `config/seen_logements.json`. Le site refuse la seconde tentative,
+mais si tu préfères éviter, lance `make run-alert` en local et laisse le VPS
+seul en `MODE=reserve`.
+
+ℹ️ Inutile de descendre l'intervalle sous ~2 s : le site met lui-même 1,8 à 3,3 s
+à répondre à un check. En dessous, on ne gagne rien et on risque le rate-limit.
 
 ## Hébergement 24/7 (à décider)
 

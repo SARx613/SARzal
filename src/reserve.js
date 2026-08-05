@@ -1,6 +1,7 @@
 import { chromium } from 'playwright';
 import { config, URLS, STORAGE_STATE } from './config.js';
 import { notify, notifyPhoto, notifyDocument, escapeHtml } from './notify.js';
+import { getWarmWindow, setWarmBusy, resetWarmWindow } from './warm.js';
 
 /**
  * RÉSERVATION AUTOMATIQUE (mode reserve)
@@ -272,16 +273,32 @@ async function launchBrowser() {
  */
 export async function reserve(dispoResidences, _nodes, opts = {}) {
   const { commit = true, force = false, targetCode = null } = opts;
-  await notify('🌐 Ouverture du navigateur pour la réservation…');
-  const browser = await launchBrowser();
-  browser.on('disconnected', () => console.warn('[reserve] Événement: navigateur déconnecté'));
-  // viewport: null en mode visible — sinon Playwright impose un viewport fixe
-  // de 1280x720 qui annule le `--start-maximized` du launch.
-  const context = await browser.newContext({
-    storageState: STORAGE_STATE,
-    ...(config.showBrowser ? { viewport: null } : {}),
-  });
-  const page = await context.newPage();
+
+  // ── Fenêtre préchauffée (local uniquement, WARM_WINDOW=true) ──────────────
+  // Si une fenêtre est déjà ouverte et posée sur la page de réservation, on la
+  // réutilise : ~2,8 s de démarrage économisées, exactement au moment où elles
+  // comptent. Sinon (VPS, ou préchauffage raté), comportement d'avant à froid.
+  const warmWin = getWarmWindow();
+  let browser;
+  let page;
+
+  if (warmWin) {
+    await notify('⚡ Réservation depuis la fenêtre déjà ouverte (démarrage à chaud).');
+    setWarmBusy(true);
+    browser = warmWin.browser;
+    page = warmWin.page;
+  } else {
+    await notify('🌐 Ouverture du navigateur pour la réservation…');
+    browser = await launchBrowser();
+    browser.on('disconnected', () => console.warn('[reserve] Événement: navigateur déconnecté'));
+    // viewport: null en mode visible — sinon Playwright impose un viewport fixe
+    // de 1280x720 qui annule le `--start-maximized` du launch.
+    const context = await browser.newContext({
+      storageState: STORAGE_STATE,
+      ...(config.showBrowser ? { viewport: null } : {}),
+    });
+    page = await context.newPage();
+  }
   // Timeout par défaut raisonnable pour toutes les actions Playwright.
   page.setDefaultTimeout(15_000);
   page.setDefaultNavigationTimeout(30_000);
@@ -332,7 +349,20 @@ export async function reserve(dispoResidences, _nodes, opts = {}) {
 
   try {
     // ── Étape A : page de réservation ────────────────────────────────────────
-    await page.goto(URLS.reservation, { waitUntil: 'domcontentloaded' });
+    // Sur une fenêtre chaude, la page de réservation est DÉJÀ chargée (~2,1 s
+    // économisées ici). On ne refait le goto que si elle a dérivé ailleurs, ou
+    // si le formulaire attendu n'est pas là — un DOM à moitié prêt coûterait
+    // bien plus cher que le rechargement qu'on cherche à éviter.
+    const dejaSurPlace =
+      warmWin &&
+      page.url().startsWith(URLS.reservation) &&
+      (await page.locator('#select2-date_arrivee-container').count().catch(() => 0)) > 0;
+
+    if (dejaSurPlace) {
+      console.log('[reserve] Page de réservation déjà chargée (fenêtre chaude) — étape A sautée.');
+    } else {
+      await page.goto(URLS.reservation, { waitUntil: 'domcontentloaded' });
+    }
     if (/login/i.test(page.url())) throw new Error('SESSION_EXPIRED');
     await screenshot('A', 'Page de réservation chargée');
 
@@ -617,10 +647,17 @@ export async function reserve(dispoResidences, _nodes, opts = {}) {
     } catch {}
     throw err;
   } finally {
-    // Fermeture protégée : ne jamais rester bloqué sur close() (browser zombie).
-    await Promise.race([
-      browser.close().catch(() => {}),
-      new Promise((r) => setTimeout(r, 10_000)),
-    ]);
+    if (warmWin) {
+      // Fenêtre chaude : on ne la ferme SURTOUT pas (ce serait perdre tout le
+      // bénéfice dès la 2e tentative). On la repose sur la page de réservation,
+      // prête pour la prochaine occasion.
+      await resetWarmWindow();
+    } else {
+      // Fermeture protégée : ne jamais rester bloqué sur close() (browser zombie).
+      await Promise.race([
+        browser.close().catch(() => {}),
+        new Promise((r) => setTimeout(r, 10_000)),
+      ]);
+    }
   }
 }
