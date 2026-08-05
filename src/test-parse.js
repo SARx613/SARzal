@@ -134,6 +134,17 @@ test('récupère le message d\'affectation caché (date de fin de bail max)', ()
   assert.ok(!l.messageAffectation.includes('&eacute;'), 'entités non décodées');
 });
 
+test('message d\'affectation trouvé même sans attribut id (name seul)', () => {
+  // Variante réelle : l'ordre et la présence des attributs changent d'un
+  // tableau à l'autre. Ne matcher que `id` faisait perdre la valeur en silence.
+  const html = PAGE.replace(
+    'id="message_affectation_3EC201A" name="message_affectation_3EC201A"',
+    'name="message_affectation_3EC201A"'
+  );
+  const l = parseLogements(html).find((x) => x.keyid === '3EC201A');
+  assert.match(l.messageAffectation, /31\/07\/2027/);
+});
+
 test('distingue keyid (code de réservation) et n° logement affiché', () => {
   const l = parseLogements(PAGE).find((x) => x.code === '3EC201');
   assert.equal(l.keyid, '3EC201A');

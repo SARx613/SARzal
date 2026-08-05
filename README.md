@@ -36,10 +36,27 @@ npm run login    # ouvre un navigateur : connecte-toi (résous le captcha) UNE f
 npm run check    # un seul check (utile pour debug)
 npm start        # boucle : check toutes les INTERVAL_MINUTES
 npm test         # tests hors-ligne (parseurs + flux de réservation complet)
+npm run diagnostic  # vérifie la chaîne complète sur le VRAI site, sans rien réserver
 ```
 
 `npm test` ne touche ni au site ni à ton compte : il rejoue le parcours contre
 un faux serveur local. À lancer avant tout déploiement.
+
+`npm run diagnostic` fait l'inverse : il interroge le vrai site avec ta vraie
+session pour vérifier que chacun des maillons répond — session valide, statuts
+lisibles, formulaire présent, et surtout **que le bot sait relire l'état de ton
+compte** (sans cette lecture, il ne peut pas distinguer un succès d'un échec).
+Il n'envoie jamais le POST de validation : quand un logement est libre, il se
+contente d'afficher le corps exact du POST qu'il aurait envoyé. Le bilan part
+aussi sur Telegram, donc c'est utilisable depuis le serveur :
+
+```bash
+fly ssh console -a sarzal -C "node src/diagnostic.js"
+```
+
+À lancer **maintenant**, sans attendre une dispo : les deux points qu'il valide
+en permanence (session + lecture du compte) sont ceux qui décident si le bot
+saura confirmer ou non.
 
 Quand la session expire, le bot t'envoie une alerte Telegram → relance `npm run login`.
 
