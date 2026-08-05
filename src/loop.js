@@ -16,7 +16,9 @@ function resumeReglesSelection() {
       (config.strictTypes ? ' (STRICT : rien d\'autre)' : ' (les autres types en dernier recours)'),
     `👥 Colocation : ${config.allowColocNonSolidaire ? 'non solidaire acceptée' : 'jamais'}` +
       ` (solidaire = toujours refusée par le site)`,
-    `🔁 Jusqu'à ${config.maxReserveAttempts} logement(s) tenté(s) si le site refuse le 1er choix`,
+    `🔁 Jusqu'à ${config.maxCandidatesPerCycle} logement(s) différent(s) tenté(s) si le site refuse le 1er choix`,
+    `✔️ Réservation vérifiée en relisant ton compte` +
+      (config.browserFallback ? ', avec rejeu dans un vrai navigateur si besoin' : ' (fallback navigateur désactivé)'),
   ].join('\n');
 }
 
