@@ -7,7 +7,7 @@ import { notify, notifyPhoto, escapeHtml } from './notify.js';
  * avec le cookie de session, ouvrir la page de réservation et prendre une
  * capture — sans attendre une vraie disponibilité. À lancer à la demande
  * sur le VPS via :
- *   fly ssh console -a sarzal -C "node src/test-browser.js"
+ *   fly ssh console -a sarzal-crfugg -C "node src/test-browser.js"
  */
 async function main() {
   await notify('🧪 Test manuel : lancement de Chromium…');

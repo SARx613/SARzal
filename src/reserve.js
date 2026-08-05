@@ -221,15 +221,25 @@ async function checkToggle(checkbox, timeoutMs = 5000) {
  * Pour forcer le vrai binaire Chromium en mode headless, il faut passer
  * `headless: false` à l'API ET ajouter `--headless=new` dans les args (c'est
  * ce flag qui active le vrai mode headless du binaire complet).
+ *
+ * Avec SHOW_BROWSER=true (sur le Mac uniquement), on retire `--headless=new` :
+ * la fenêtre s'ouvre pour de vrai. Les args de conteneur (`--no-sandbox`,
+ * `--disable-dev-shm-usage`, `--disable-gpu`) n'ont alors plus lieu d'être et
+ * dégradent le rendu — on les laisse au VPS.
  */
 async function launchBrowser() {
-  const LAUNCH_ARGS = [
-    '--no-sandbox',
-    '--disable-setuid-sandbox',
-    '--disable-dev-shm-usage',
-    '--disable-gpu',
-    '--headless=new',
-  ];
+  const LAUNCH_ARGS = config.showBrowser
+    ? ['--start-maximized']
+    : [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--headless=new',
+      ];
+  if (config.showBrowser) {
+    console.log('[reserve] SHOW_BROWSER=true → Chromium ouvert en fenêtre visible.');
+  }
   for (let attempt = 1; attempt <= 2; attempt++) {
     const browser = await chromium.launch({
       headless: false, // le vrai mode headless vient de --headless=new dans args
@@ -265,7 +275,12 @@ export async function reserve(dispoResidences, _nodes, opts = {}) {
   await notify('🌐 Ouverture du navigateur pour la réservation…');
   const browser = await launchBrowser();
   browser.on('disconnected', () => console.warn('[reserve] Événement: navigateur déconnecté'));
-  const context = await browser.newContext({ storageState: STORAGE_STATE });
+  // viewport: null en mode visible — sinon Playwright impose un viewport fixe
+  // de 1280x720 qui annule le `--start-maximized` du launch.
+  const context = await browser.newContext({
+    storageState: STORAGE_STATE,
+    ...(config.showBrowser ? { viewport: null } : {}),
+  });
   const page = await context.newPage();
   // Timeout par défaut raisonnable pour toutes les actions Playwright.
   page.setDefaultTimeout(15_000);

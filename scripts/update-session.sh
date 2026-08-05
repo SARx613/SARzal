@@ -10,8 +10,16 @@
 
 set -e
 
-APP="sarzal"
+# Le nom de l'app est lu depuis fly.toml : c'est la seule source de vérité.
+# (Il a déjà changé une fois — "sarzal" → "sarzal-crfugg" — et le nom codé en
+# dur ici faisait échouer le script avec "Could not find App".)
+APP=$(sed -n "s/^app *= *['\"]\(.*\)['\"].*/\1/p" fly.toml | head -1)
 SESSION_FILE="config/session.json"
+
+if [ -z "$APP" ]; then
+  echo "❌ Impossible de lire le nom de l'app dans fly.toml"
+  exit 1
+fi
 
 if [ ! -f "$SESSION_FILE" ]; then
   echo "❌ $SESSION_FILE introuvable. Lance d'abord : npm run login"
@@ -21,7 +29,7 @@ fi
 echo "📦 Encodage de la session en base64…"
 SESSION_B64=$(base64 -i "$SESSION_FILE")
 
-echo "🚀 Envoi du secret SESSION_JSON_B64 sur Fly.io…"
+echo "🚀 Envoi du secret SESSION_JSON_B64 sur Fly.io (app : $APP)…"
 fly secrets set SESSION_JSON_B64="$SESSION_B64" --app "$APP"
 
 echo "🔄 Redémarrage de toutes les machines…"
