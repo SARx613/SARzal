@@ -7,7 +7,10 @@
     "login": "node src/login.js",
     "check": "node src/monitor.js",
     "start": "node src/loop.js",
-    "test:selection": "node src/test-selection.js"
+    "test": "node src/test-parse.js && node src/test-reservation.js",
+    "test:selection": "node src/test-selection.js",
+    "check-reserve": "node src/test-reservation.js",
+    "diagnostic": "node src/diagnostic.js"
   },
   "keywords": [],
   "author": "",

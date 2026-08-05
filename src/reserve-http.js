@@ -1,58 +1,75 @@
 import { config, URLS, residenceLabel } from './config.js';
 import { notify, notifyDocument, escapeHtml } from './notify.js';
+import { postForm, getPage, looksLikeLogin } from './http.js';
 
 /**
- * RÉSERVATION 100 % HTTP — SANS NAVIGATEUR.
+ * RÉSERVATION HTTP + VÉRIFICATION D'ÉTAT.
  *
- * Découverte majeure (HTML réel capturé, cf. config/reserve_step_J.html) :
- * TOUT le parcours de réservation du site est purement CÔTÉ CLIENT. Les clics
- * "résidence → aile → escalier → niveau → logement" ne font QUE masquer/afficher
- * des <div> DÉJÀ présents dans la page (aucun appel AJAX). Concrètement, l'unique
- * réponse HTTP que la surveillance récupère déjà (POST modifier_date_arrivee)
- * contient, en clair :
- *   • les lignes logement  <tr id="tr_logement_XXX">…</tr>  avec tous les détails
- *     (code, type, loyer, surface, colocation, occupants…) de TOUTES les
- *     résidences à la fois, chacune DANS son <div id="niveau_R_A_C_N_logements">,
- *   • le formulaire de validation complet <form id="action-validation_reservation">
- *     avec keyid, nb_occupants, est_caution_solidaire, date_entree, date_sortie…
+ * ── Ce qui n'allait pas (audit du 04/08/2026) ─────────────────────────────
+ * Une Résidence III/IV s'est libérée, le bot a envoyé "✅ RÉSERVATION
+ * PROBABLEMENT CONFIRMÉE", et rien n'était réservé. Trois causes cumulées :
  *
- * Donc :
- *   – lire les détails du logement = parser le HTML déjà en main (0 requête, ~1 ms) ;
- *   – RÉSERVER = UN SEUL POST `action=validation_reservation`, en reproduisant
- *     exactement ce que fait le JS du site au clic sur la ligne (cf. plus bas).
+ *  1. PAYLOAD INCOMPLET. Le formulaire #action-validation_reservation est bien
+ *     présent dans le HTML, mais VIDE : ce sont les scripts du site qui le
+ *     remplissent quand on coche le toggle #check_logement_XXX (date de début
+ *     de bail, date de fin souhaitée, nb d'occupants, keyid, message
+ *     d'affectation — cf. la capture "Votre réservation de logement"). En HTTP
+ *     pur, aucun de ces scripts ne tourne : l'ancien code repostait les champs
+ *     tels quels, donc VIDES, en ne renseignant que `keyid`. Le serveur n'avait
+ *     aucune raison d'enregistrer quoi que ce soit.
  *
- * ⚠️ POINT CRITIQUE quand PLUSIEURS logements sont dispos en même temps :
- * le HTML contient les lignes de TOUTES les résidences, dans l'ordre du DOM
- * (Résidence I d'abord). Il faut donc :
- *   1. rattacher chaque ligne à SA résidence — le site le fait lui-même via
- *      `var residence = keyid.substr(0,1)` (1er caractère du keyid, ex 3EC201A
- *      → résidence 3) ; on utilise en priorité le <div id="niveau_3_E_C_2_logements">
- *      englobant, qui donne en plus l'aile / l'escalier / le niveau exacts ;
- *   2. CHOISIR selon les préférences (type, sans colocation…) et pas "le premier
- *      du document" ;
- *   3. recalculer nb_occupants + est_caution_solidaire DEPUIS LA LIGNE CHOISIE :
- *      le JS du site les repose à chaque clic ($("#nb_occupants").val(...)), donc
- *      les valeurs statiques du <form> correspondent à un AUTRE logement dès
- *      qu'il y en a plusieurs.
+ *  2. SUCCÈS DÉCLARÉ SANS PREUVE. `interpretValidationResult` concluait au
+ *     succès dès que la chaîne "Valider votre réservation" était absente de la
+ *     réponse — ce qui est justement le cas de toutes les pages d'erreur, de la
+ *     page de login, ou d'un simple retour à l'accueil. Idem pour toute
+ *     redirection 3xx, comptée comme succès. D'où le faux ✅.
  *
- * La colocation SOLIDAIRE reste NON auto-réservable (le site exige côté serveur
- * l'email d'un colocataire ayant un compte Césal actif — cf.
- * cesal_ajax_check_email.php, branche `if (est_caution_solidaire==1)`).
- * On la détecte et on alerte pour réservation manuelle.
+ *  3. L'OCCASION ÉTAIT BRÛLÉE. La signature et les codes logement étaient
+ *     marqués "vus" AVANT la tentative : après l'échec, plus aucune alerte ni
+ *     nouvel essai de la journée sur un logement pourtant toujours libre.
+ *
+ * ── Ce qu'on fait maintenant ──────────────────────────────────────────────
+ *  • on reconstruit le payload en ÉMULANT ce que fait le JS du site ;
+ *  • on ne déclare JAMAIS un succès sur la seule foi de la réponse au POST :
+ *    on RELIT la page du compte et on vérifie qu'un logement y est réservé ;
+ *  • si ce n'est pas le cas, on rejoue le flux dans un vrai navigateur (qui
+ *    exécute le JS du site et la popup de confirmation), puis on re-vérifie ;
+ *  • tant que rien n'est confirmé, on n'éteint ni l'alerte ni les tentatives.
+ *
+ * La colocation reste non auto-réservable : le site exige côté serveur l'email
+ * d'un colocataire ayant un compte Césal actif (cesal_ajax_check_email.php).
  */
 
 /* ─────────────────────────── Helpers de parsing ─────────────────────────── */
+
+const ENTITIES = {
+  '&amp;': '&', '&lt;': '<', '&gt;': '>', '&quot;': '"',
+  '&#39;': "'", '&apos;': "'", '&nbsp;': ' ', '&eacute;': 'é', '&egrave;': 'è',
+};
+
+/** Décode les entités HTML d'un attribut (les valeurs de champ en contiennent). */
+export function decodeEntities(str) {
+  return String(str).replace(/&(amp|lt|gt|quot|#39|apos|nbsp|eacute|egrave);/gi, (m) => ENTITIES[m.toLowerCase()] ?? m);
+}
 
 /** Enlève les balises HTML et normalise les espaces d'un fragment. */
 function stripTags(html) {
   return String(html)
     .replace(/<sup>2<\/sup>/gi, '²') // m<sup>2</sup> → m²
     .replace(/<br\s*\/?>/gi, ' ')
-    .replace(/<[^>]+>/g, '')
+    .replace(/<[^>]+>/g, ' ')
     .replace(/&nbsp;/gi, ' ')
     .replace(/&amp;/gi, '&')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+/** Lit la valeur d'un attribut dans une chaîne d'attributs de balise. */
+function attr(attrs, name) {
+  const m =
+    attrs.match(new RegExp(`\\b${name}\\s*=\\s*"([^"]*)"`, 'i')) ||
+    attrs.match(new RegExp(`\\b${name}\\s*=\\s*'([^']*)'`, 'i'));
+  return m ? m[1] : undefined;
 }
 
 /** Découpe une ligne <tr> en ses cellules <td> (contenu HTML brut de chacune). */
@@ -80,38 +97,30 @@ export function normalizeType(t) {
 }
 
 /**
- * Repère tous les conteneurs de niveau `<div id="niveau_R_A_C_N_logements">` avec
- * leur position dans le HTML. Ces <div> sont des frères (jamais imbriqués), donc
- * une ligne <tr> appartient au DERNIER conteneur ouvert avant elle.
+ * Repère les conteneurs de niveau `id="niveau_<res>_<aile>_<cage>_<niv>_logements"`
+ * pour pouvoir rattacher chaque ligne logement à SA résidence.
+ *
+ * ⚠️ Sans ça, `parseLogements` ramassait indistinctement toutes les lignes de la
+ * page : si la Résidence I et la Résidence III avaient chacune une dispo, le bot
+ * pouvait très bien tenter de réserver celui de la Résidence I alors qu'il avait
+ * été déclenché pour la III. On filtre maintenant explicitement.
  */
-function buildNiveauIndex(html) {
-  const idx = [];
-  const re = /<div\s+id="niveau_(\d+)_([A-Za-z0-9]+)_([A-Za-z0-9]+)_(\d+)_logements"/gi;
-  for (const m of html.matchAll(re)) {
-    idx.push({
-      pos: m.index,
-      residence: m[1],
-      aile: m[2],
-      cage: m[3],
-      niveau: m[4],
-    });
-  }
-  return idx;
-}
-
-/** Dernier conteneur de niveau ouvert avant la position `pos`. */
-function locateNiveau(idx, pos) {
-  let found = null;
-  for (const c of idx) {
-    if (c.pos < pos) found = c;
-    else break;
-  }
-  return found;
+function niveauMarkers(html) {
+  return [
+    ...html.matchAll(/id="(niveau_(\d+)_([A-Za-z0-9]+)_([A-Za-z0-9]+)_(\d+))_logements"/g),
+  ].map((m) => ({
+    index: m.index,
+    niveauId: m[1],
+    residenceNum: m[2],
+    aile: m[3],
+    cage: m[4],
+    niveau: m[5],
+  }));
 }
 
 /**
  * Parse toutes les lignes de logements disponibles présentes dans le HTML.
- * Structure confirmée (cf. docs/html-samples + reserve_step_J.html) :
+ * Structure confirmée (cf. docs/html-samples/tableaux_1D112_extrait.html) :
  *   td[0] = toggle "Réservation ?" (#check_logement_XXX) + message_affectation
  *   td[1] = N° logement (ex. 3EC201)   td[2] = Type
  *   td[3] = Colocation ?               td[4] = Nbr occupants
@@ -119,26 +128,36 @@ function locateNiveau(idx, pos) {
  *   td[7] = Balcon ?                   td[8] = Boursier prioritaire ?
  *   td[9] = Loyer CC   td[10] = Dépôt garantie   td[11] = Frais de dossier
  *
- * Le CODE de réservation (keyid) est le suffixe de l'id `tr_logement_XXX`
- * (ex. `3EC201A`) — c'est bien ce que le site place dans #keyid au submit, PAS
- * le n° logement affiché (`3EC201`). On garde donc les deux distinctement.
- *
- * Chaque logement est enrichi de SA localisation (résidence / aile / escalier /
- * niveau) déduite du <div> englobant — indispensable dès qu'il y a plusieurs
- * résidences dispos en même temps.
+ * Le CODE de réservation (keyid) est le suffixe de l'id `tr_logement_XXX` — c'est
+ * ce que le site place dans #keyid au submit, PAS forcément le n° affiché.
  */
 export function parseLogements(html) {
-  const niveaux = buildNiveauIndex(html);
+  const markers = niveauMarkers(html);
   const rows = [...html.matchAll(/<tr\s+id="tr_logement_([^"]+)"[^>]*>([\s\S]*?)<\/tr>/gi)];
   const result = [];
-  for (const m of rows) {
-    const [, keyid, rowHtml] = m;
+  for (const row of rows) {
+    const [, keyid, rowHtml] = row;
     const tds = splitCells(rowHtml);
     const at = (n) => stripTags(tds[n] || '');
-    const loc = locateNiveau(niveaux, m.index);
-    // Repli si le <div> englobant n'est pas identifiable : le site lui-même
+
+    // Conteneur de niveau le plus proche AVANT cette ligne → sa résidence.
+    let owner = null;
+    for (const m of markers) {
+      if (m.index < row.index) owner = m;
+      else break;
+    }
+
+    // <input type="hidden" id="message_affectation_XXX" name="…" value="La date
+    // de fin de bail maximale autorisée…"> : le site le recopie dans le
+    // formulaire final. On accepte `id` OU `name` : l'ordre des attributs et
+    // leur présence varient d'un tableau à l'autre, et ne matcher que `id`
+    // faisait silencieusement perdre la valeur.
+    const msg = rowHtml.match(/<input\b[^>]*\b(?:id|name)="message_affectation_[^"]*"[^>]*>/i);
+    const messageAffectation = msg ? decodeEntities(attr(msg[0], 'value') || '') : '';
+
+    // Repli si le conteneur englobant n'est pas identifiable : le site lui-même
     // déduit la résidence du 1er caractère du keyid (`keyid.substr(0,1)`).
-    const residence = loc?.residence || (String(keyid).match(/^\d/) || [''])[0];
+    const residence = owner?.residenceNum || (String(keyid).match(/^\d/) || [''])[0];
 
     const l = {
       keyid,                 // = suffixe tr_logement_XXX → valeur du champ #keyid
@@ -155,13 +174,16 @@ export function parseLogements(html) {
       loyer: at(9),
       depotGarantie: at(10),
       fraisDossier: at(11),
+      messageAffectation,
+      niveauId: owner?.niveauId || null,
+      residenceNum: owner?.residenceNum || null,
 
       // ── Champs dérivés (sélection & tri) ──────────────────────────────────
       residence,                                   // "3"
       residenceId: residence ? `residence_${residence}` : '',
-      aile: loc?.aile || '',
-      cage: loc?.cage || '',
-      niveau: loc?.niveau || '',
+      aile: owner?.aile || '',
+      cage: owner?.cage || '',
+      niveau: owner?.niveau || '',
       typeNorm: normalizeType(at(2)),
       loyerNum: parseMontant(at(9)),
       surfaceNum: parseSurface(at(6)),
@@ -179,6 +201,16 @@ export function buildCheminLogement(l) {
   if (l.cage) parts.push(`Escalier ${l.cage}`);
   if (l.niveau) parts.push(`Niveau R+${l.niveau}`);
   return parts.join(' › ');
+}
+
+/** Ne garde que les logements rattachés à la résidence demandée (ex. '3'). */
+export function filterByResidence(logements, residenceNum) {
+  if (!residenceNum) return logements;
+  const scoped = logements.filter((l) => l.residenceNum === String(residenceNum));
+  // Repli : si le rattachement n'a pas pu être fait (structure inattendue), on
+  // préfère rendre la liste complète plutôt que de rater la dispo — mais
+  // l'appelant est prévenu via `scopeKnown`.
+  return scoped.length ? scoped : logements.filter((l) => l.residenceNum === null);
 }
 
 /** Nombre d'occupants du logement (1 si illisible). */
@@ -212,55 +244,6 @@ export function isSolidaire(l) {
 /** Valeur à envoyer dans le champ caché `est_caution_solidaire`. */
 export function estCautionSolidaireValue(l) {
   return isSolidaire(l) ? '1' : '0';
-}
-
-/**
- * Extrait tous les champs du <form id="action-validation_reservation"> tel qu'il
- * est dans le HTML, sous forme de paires {name: value}. On repart des VRAIS
- * champs de la page (plutôt que de les reconstruire à la main) pour rester
- * robuste si le site ajoute/retire un champ. On ne garde que les inputs à
- * l'intérieur de CE form précis.
- */
-export function parseReservationForm(html) {
-  const formMatch = html.match(
-    /<form[^>]*id="action-validation_reservation"[^>]*>([\s\S]*?)<\/form>/i
-  );
-  if (!formMatch) return null;
-  const inner = formMatch[1];
-  const fields = {};
-  for (const m of inner.matchAll(/<input\b([^>]*)>/gi)) {
-    const attrs = m[1];
-    const name = (attrs.match(/\bname="([^"]*)"/i) || [])[1];
-    if (!name) continue;
-    const value = (attrs.match(/\bvalue="([^"]*)"/i) || [])[1] ?? '';
-    fields[name] = value;
-  }
-  return fields;
-}
-
-/** Formate les caractéristiques d'un logement en lignes lisibles pour Telegram. */
-export function formatLogementDetails(l) {
-  return [
-    `🔑 N° logement : ${l.code}`,
-    `📍 ${l.chemin || buildCheminLogement(l)}`,
-    `🏷️ Type : ${l.type}`,
-    `👥 Colocation : ${l.colocation}`,
-    `🔢 Nbr occupants : ${l.nbOccupants}`,
-    `📐 Surface : ${l.surface}`,
-    `💶 Loyer charges comprises : ${l.loyer}`,
-    `🔒 Dépôt garantie : ${l.depotGarantie}`,
-    `📄 Frais de dossier : ${l.fraisDossier}`,
-  ].join('\n');
-}
-
-/** Ligne compacte pour l'inventaire "voici tout ce qui est dispo". */
-function formatLogementLigne(l) {
-  const flags = [];
-  if (isSolidaire(l)) flags.push('👥 coloc solidaire');
-  else if (isColocation(l)) flags.push(`👥 coloc (${nbOccupantsOf(l)})`);
-  else flags.push('🙋 individuel');
-  if (/\boui\b/i.test(l.pmr || '')) flags.push('♿ PMR');
-  return `• <b>${l.code}</b> — ${l.type}, ${l.surface}, ${l.loyer} — ${l.chemin} — ${flags.join(', ')}`;
 }
 
 /* ────────────────────────────── Sélection ──────────────────────────────── */
@@ -326,282 +309,582 @@ export function rankCandidates(logements, opts = {}) {
   return { candidats, colocSolidaires, horsPrefs };
 }
 
-/* ────────────────────────────── Réservation ────────────────────────────── */
+/* ────────────────── Formulaire de validation : extraction ────────────────── */
 
 /**
- * Envoie le POST de validation d'une réservation (équivalent HTTP exact du clic
- * "Valider votre réservation"). On repart des champs réels du form, puis on
- * REPOSE les 3 champs que le JS du site recalcule à chaque sélection de ligne :
- *   #keyid                 ← keyid du logement choisi  (submit_reservation)
- *   #nb_occupants          ← td[4] de SA ligne          (handler du clic)
- *   #est_caution_solidaire ← td[3] de SA ligne          (handler du clic)
- * Sans ça, avec plusieurs logements dispos, on enverrait les occupants d'un
- * autre logement que celui qu'on réserve. Renvoie { status, html, sent }.
+ * Extrait le formulaire de validation et TOUS ses champs soumissibles.
+ *
+ * Corrections par rapport à l'ancienne version, qui ne lisait que les <input> :
+ *   • les <select> et <textarea> sont désormais pris en compte (un champ oublié
+ *     = un formulaire refusé côté serveur) ;
+ *   • les checkbox/radio NON cochées sont exclues — un navigateur ne les envoie
+ *     pas, les inclure fait diverger le POST de ce que le site attend ;
+ *   • les boutons (submit/button/reset/image) sont exclus ;
+ *   • les valeurs sont décodées (entités HTML).
  */
-export function buildValidationPayload(formFields, logement) {
-  return {
-    ...formFields,
-    keyid: logement.keyid,
-    nb_occupants: String(nbOccupantsOf(logement)),
-    est_caution_solidaire: estCautionSolidaireValue(logement),
+export function parseValidationForm(html) {
+  const forms = [...html.matchAll(/<form\b([^>]*)>([\s\S]*?)<\/form>/gi)];
+  let picked = null;
+  for (const f of forms) {
+    const id = attr(f[1], 'id') || '';
+    const action = attr(f[1], 'action') || '';
+    if (/validation_reservation/i.test(id) || /validation_reservation/i.test(action)) {
+      picked = f;
+      break;
+    }
+  }
+  // Repli : le formulaire qui contient le champ #keyid.
+  if (!picked) picked = forms.find((f) => /name="keyid"/i.test(f[2]));
+  if (!picked) return null;
+
+  const inner = picked[2];
+  const fields = [];
+
+  for (const m of inner.matchAll(/<input\b([^>]*?)\/?>/gi)) {
+    const attrs = m[1];
+    const name = attr(attrs, 'name');
+    if (!name) continue;
+    const type = (attr(attrs, 'type') || 'text').toLowerCase();
+    if (['submit', 'button', 'reset', 'image', 'file'].includes(type)) continue;
+    const checked = /\bchecked\b/i.test(attrs);
+    if ((type === 'checkbox' || type === 'radio') && !checked) continue;
+    const raw = attr(attrs, 'value');
+    const value = decodeEntities(raw ?? (type === 'checkbox' || type === 'radio' ? 'on' : ''));
+    fields.push({ name, value, type });
+  }
+
+  for (const m of inner.matchAll(/<select\b([^>]*)>([\s\S]*?)<\/select>/gi)) {
+    const name = attr(m[1], 'name');
+    if (!name) continue;
+    const options = [...m[2].matchAll(/<option\b([^>]*)>([\s\S]*?)<\/option>/gi)];
+    const chosen = options.find((o) => /\bselected\b/i.test(o[1])) || options[0];
+    const value = chosen ? decodeEntities(attr(chosen[1], 'value') ?? stripTags(chosen[2])) : '';
+    fields.push({ name, value, type: 'select' });
+  }
+
+  for (const m of inner.matchAll(/<textarea\b([^>]*)>([\s\S]*?)<\/textarea>/gi)) {
+    const name = attr(m[1], 'name');
+    if (!name) continue;
+    fields.push({ name, value: decodeEntities(stripTags(m[2])), type: 'textarea' });
+  }
+
+  return { id: attr(picked[1], 'id') || '', action: attr(picked[1], 'action') || '', fields };
+}
+
+/** Rétro-compat : ancienne API {name: value}, encore utilisée par des scripts. */
+export function parseReservationForm(html) {
+  const parsed = parseValidationForm(html);
+  if (!parsed) return null;
+  return Object.fromEntries(parsed.fields.map((f) => [f.name, f.value]));
+}
+
+/**
+ * Construit le corps du POST de validation en ÉMULANT ce que fait le JS du site
+ * lorsqu'on coche le toggle #check_logement_XXX puis qu'on clique "Valider
+ * votre réservation" :
+ *
+ *   • #keyid                        ← code de réservation du logement choisi
+ *   • check_logement_<keyid>=on     ← le toggle réellement coché
+ *   • message_affectation_<keyid>   ← recopié depuis la ligne du tableau
+ *   • date de début de bail         ← date d'arrivée sélectionnée pour le scan
+ *   • date de fin de bail souhaitée ← DATE_SORTIE
+ *   • nb d'occupants                ← valeur de la ligne du tableau
+ *   • action=validation_reservation ← si le formulaire ne le porte pas lui-même
+ *
+ * Les noms de champs varient : on les repère par MOTIF plutôt qu'en dur, et on
+ * ne remplit que ceux qui sont VIDES (jamais d'écrasement d'une valeur que le
+ * site aurait déjà posée).
+ *
+ * Renvoie { body, fields, filled, stillEmpty } — `filled`/`stillEmpty` servent
+ * au diagnostic envoyé sur Telegram en cas d'échec.
+ */
+export function buildValidationPayload(html, logement, { dateArrivee, dateSortie } = {}) {
+  const parsed = parseValidationForm(html);
+  if (!parsed) return null;
+
+  const fields = new Map(parsed.fields.map((f) => [f.name, f.value]));
+  const filled = [];
+
+  const force = (name, value) => {
+    if (value === undefined || value === null || value === '') return;
+    if (fields.get(name) !== String(value)) filled.push(name);
+    fields.set(name, String(value));
   };
+  const fillIfEmpty = (name, value) => {
+    if (value === undefined || value === null || value === '') return;
+    if ((fields.get(name) ?? '') === '') {
+      fields.set(name, String(value));
+      filled.push(name);
+    }
+  };
+
+  // 1. Le logement choisi.
+  force('keyid', logement.keyid);
+  force(`check_logement_${logement.keyid}`, 'on');
+  if (logement.messageAffectation) {
+    force(`message_affectation_${logement.keyid}`, logement.messageAffectation);
+  }
+
+  // 2. L'action : si le formulaire ne porte pas son propre champ `action`, le
+  //    POST ne serait rattaché à aucun traitement côté serveur.
+  if (!fields.get('action')) force('action', 'validation_reservation');
+
+  // 2 bis. Les 2 champs que le JS du site RECALCULE à chaque sélection de ligne
+  //    à partir des <td> du logement coché (et pas d'un autre). Avec plusieurs
+  //    logements dispos, les laisser tels quels enverrait les caractéristiques
+  //    d'une autre ligne que celle qu'on réserve — donc on les FORCE.
+  if (fields.has('est_caution_solidaire')) {
+    force('est_caution_solidaire', estCautionSolidaireValue(logement));
+  }
+  if (fields.has('nb_occupants')) {
+    force('nb_occupants', String(nbOccupantsOf(logement)));
+  }
+
+  // 3. Les dates. Le site les affiche ("Date de début de bail 06/08/2026",
+  //    "Date de fin de bail souhaitée 18/12/2026") uniquement après le clic sur
+  //    le toggle — donc vides dans le HTML brut.
+  const nbOcc = String(logement.nbOccupants || '').replace(/\D/g, '');
+  for (const name of fields.keys()) {
+    if (/date/i.test(name) && /(entree|entrée|arrivee|arrivée|debut|début)/i.test(name)) {
+      fillIfEmpty(name, dateArrivee);
+    } else if (/date/i.test(name) && /(sortie|fin)/i.test(name)) {
+      fillIfEmpty(name, dateSortie);
+    } else if (/(nb|nombre).*occupant/i.test(name)) {
+      fillIfEmpty(name, nbOcc);
+    }
+  }
+
+  // 4. Filet : certains formulaires n'exposent le champ qu'au moment du submit
+  //    JS. Si aucune date n'a pu être posée, on ajoute les noms canoniques vus
+  //    sur le site plutôt que d'envoyer un formulaire sans aucune date.
+  const hasEntree = [...fields].some(([n, v]) => /date/i.test(n) && /(entree|arrivee|debut)/i.test(n) && v);
+  const hasSortie = [...fields].some(([n, v]) => /date/i.test(n) && /(sortie|fin)/i.test(n) && v);
+  if (!hasEntree && dateArrivee) force('date_arrivee', dateArrivee);
+  if (!hasSortie && dateSortie) force('date_sortie', dateSortie);
+
+  const stillEmpty = [...fields].filter(([, v]) => v === '').map(([n]) => n);
+
+  const params = new URLSearchParams();
+  for (const [name, value] of fields) params.set(name, value);
+
+  return { body: params.toString(), fields, filled, stillEmpty, formId: parsed.id };
 }
 
-async function postValidation(cookieHeader, formFields, logement) {
-  const payload = buildValidationPayload(formFields, logement);
-  const body = new URLSearchParams(payload);
-  const res = await fetch(URLS.reservation, {
-    method: 'POST',
-    redirect: 'manual',
-    headers: {
-      'content-type': 'application/x-www-form-urlencoded',
-      origin: 'https://logement.cesal.fr',
-      referer: URLS.reservation,
-      'user-agent':
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36',
-      cookie: cookieHeader,
-    },
-    body: body.toString(),
-  });
-  const html = await res.text().catch(() => '');
-  return { status: res.status, html, sent: payload };
+/** Formate les caractéristiques d'un logement en lignes lisibles pour Telegram. */
+export function formatLogementDetails(l) {
+  const e = (v) => escapeHtml(v ?? '');
+  return [
+    `🔑 N° logement : ${e(l.code)}`,
+    `📍 ${e(l.chemin || buildCheminLogement(l))}`,
+    `🏷️ Type : ${e(l.type)}`,
+    `👥 Colocation : ${e(l.colocation)}`,
+    `🔢 Nbr occupants : ${e(l.nbOccupants)}`,
+    `📐 Surface : ${e(l.surface)}`,
+    `💶 Loyer charges comprises : ${e(l.loyer)}`,
+    `🔒 Dépôt garantie : ${e(l.depotGarantie)}`,
+    `📄 Frais de dossier : ${e(l.fraisDossier)}`,
+  ].join('\n');
 }
+
+/** Ligne compacte pour l'inventaire "voici tout ce qui est dispo". */
+function formatLogementLigne(l) {
+  const e = (v) => escapeHtml(v ?? '');
+  const flags = [];
+  if (isSolidaire(l)) flags.push('👥 coloc solidaire');
+  else if (isColocation(l)) flags.push(`👥 coloc (${nbOccupantsOf(l)})`);
+  else flags.push('🙋 individuel');
+  if (/\boui\b/i.test(l.pmr || '')) flags.push('♿ PMR');
+  return `• <b>${e(l.code)}</b> — ${e(l.type)}, ${e(l.surface)}, ${e(l.loyer)} — ${e(l.chemin)} — ${flags.join(', ')}`;
+}
+
+/* ───────────────────── Vérification de l'état du compte ─────────────────── */
 
 /**
- * Interprète la réponse du POST de validation pour dire si la réservation a
- * réellement abouti. Signaux (déduits du JS/HTML du site) :
- *   • ÉCHEC   : message NON VIDE dans #submit_reservation_error_message.
- *   • SUCCÈS  : confirmation explicite, ou disparition du bouton "Valider votre
- *               réservation" sans message d'erreur.
- * En cas de doute on renvoie 'incertain' pour ne jamais annoncer un faux succès.
+ * Lit la page du compte et dit si un logement y est RÉSERVÉ. C'est la seule
+ * source de vérité : la réponse au POST de validation, elle, peut ressembler à
+ * n'importe quoi (redirection, page d'accueil, page d'erreur silencieuse).
+ *
+ * Renvoie 'reserved' | 'none' | 'session' | 'unknown'.
  */
-export function interpretValidationResult(html) {
+export function interpretAccountPage(html, code) {
+  if (looksLikeLogin(html)) return 'session';
   const text = stripTags(html);
 
-  // La page renvoyée est encore un login → session tombée pile pendant le POST.
-  if (/g-recaptcha|name="login-email"/.test(html)) {
+  // Message explicite du site quand le compte n'a RIEN : "vous n'avez aucun
+  // bien en location ou réservé". C'est le signal négatif le plus fiable.
+  if (/aucun bien\b[^.]{0,80}r[ée]serv/i.test(text)) return 'none';
+
+  // Signaux positifs explicites.
+  if (
+    /votre r[ée]servation a bien [ée]t[ée]/i.test(text) ||
+    /r[ée]servation (enregistr|valid|confirm|prise en compte)/i.test(text) ||
+    /demande de r[ée]servation[^.]{0,60}(enregistr|prise en compte)/i.test(text) ||
+    /logement r[ée]serv[ée]/i.test(text)
+  ) {
+    return 'reserved';
+  }
+
+  // Le code du logement apparaît alors qu'il n'y a plus de tableau de sélection
+  // (plus aucune ligne tr_logement_) → il est devenu "mon logement".
+  if (code && text.includes(code) && !/id="tr_logement_/i.test(html)) return 'reserved';
+
+  return 'unknown';
+}
+
+/** Relit la page du compte (GET) et interprète son état. */
+export async function verifyReservationState(cookieHeader, code) {
+  try {
+    const { html, status } = await getPage(URLS.reservation, cookieHeader);
+    return { state: interpretAccountPage(html, code), html, status };
+  } catch (err) {
+    return { state: 'unknown', html: '', error: err.message };
+  }
+}
+
+/**
+ * Interprète la réponse IMMÉDIATE au POST de validation.
+ *
+ * ⚠️ Volontairement PESSIMISTE désormais : cette fonction ne peut plus renvoyer
+ * `ok: true` sur une simple absence de bouton. Elle sert à repérer un refus
+ * explicite (et sa raison) ; la confirmation, elle, vient de la relecture du
+ * compte (verifyReservationState).
+ */
+export function interpretValidationResult(html) {
+  if (looksLikeLogin(html)) {
     return { ok: false, reason: 'Session expirée pendant la validation' };
   }
 
-  // ⚠️ Le div #submit_reservation_error (titre "VALIDATION DES INFORMATIONS
-  // IMPOSSIBLE") est TOUJOURS présent dans la page en display:none — sa simple
-  // présence NE signifie PAS un échec. Le vrai signal d'échec serveur est un
-  // MESSAGE d'erreur NON VIDE dans #submit_reservation_error_message (rempli
-  // côté serveur en cas de refus), donc on ne conclut à l'échec que là-dessus.
+  // Le div #submit_reservation_error est TOUJOURS présent en display:none — sa
+  // présence ne prouve rien. Le vrai refus, c'est un MESSAGE non vide dedans.
   const errMsg = stripTags(
-    (html.match(/id="submit_reservation_error_message"[^>]*>([\s\S]*?)<\/span>/i) || [])[1] || ''
+    (html.match(/id="submit_reservation_error_message"[^>]*>([\s\S]*?)<\/(?:span|div)>/i) || [])[1] || ''
   );
-  if (errMsg) {
-    return { ok: false, reason: errMsg };
-  }
+  if (errMsg) return { ok: false, reason: errMsg };
 
-  // Confirmation explicite du voeu (le site affiche l'état "réservé / en cours"
-  // ou la demande enregistrée). Formulations à confirmer sur un vrai succès.
-  if (/logement r.serv|r.servation (enregistr|valid|confirm)|voeu.*enregistr|demande.*enregistr/i.test(text)) {
+  // ⚠️ Ne PAS chercher le titre "VALIDATION DES INFORMATIONS IMPOSSIBLE" dans le
+  // texte : il est présent dans TOUTES les pages du site (le div qui le porte est
+  // en display:none tant qu'il n'y a pas d'erreur). S'en servir ferait échouer
+  // toutes les validations, y compris les bonnes. Seul le message d'erreur
+  // rempli ci-dessus fait foi côté réponse ; la confirmation, elle, vient de la
+  // relecture du compte.
+
+  if (/votre r[ée]servation a bien [ée]t[ée]|r[ée]servation (enregistr|valid|confirm)/i.test(stripTags(html))) {
     return { ok: true };
   }
 
-  // Si le formulaire de validation ("Valider votre réservation") a disparu de la
-  // page ET qu'aucun message d'erreur n'est rempli, la demande a très
-  // probablement été prise → succès probable (à vérifier côté site).
-  if (!/Valider votre r.servation/i.test(html)) {
-    return { ok: true, probable: true };
-  }
-
-  // Le formulaire est encore là sans erreur remplie : soit le POST n'a rien
-  // changé, soit la page ne reflète pas encore le voeu → indéterminé.
-  return { ok: null, reason: 'résultat indéterminé' };
+  return { ok: null, reason: 'réponse non concluante — vérification du compte requise' };
 }
 
-/** Sauvegarde best-effort d'un HTML dans config/ (debug post-mortem). */
-async function dumpHtml(nom, html) {
+/* ────────────────────────────── Orchestration ───────────────────────────── */
+
+async function sendHtml(caption, html, filename) {
+  if (!html) return;
   try {
-    const { writeFileSync } = await import('fs');
-    writeFileSync(new URL(`../config/${nom}`, import.meta.url).pathname, html);
+    await notifyDocument(caption, Buffer.from(html, 'utf8'), filename);
+  } catch (e) {
+    console.warn('[reserve-http] Envoi HTML échoué:', e.message);
+  }
+}
+
+/** Sauvegarde locale best-effort (le volume Fly est éphémère : c'est du bonus). */
+async function saveLocal(filename, content) {
+  try {
+    const { writeFileSync, mkdirSync } = await import('fs');
+    const dir = new URL('../config/', import.meta.url).pathname;
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(dir + filename, content);
   } catch {}
 }
 
 /**
+ * Tente la réservation d'un logement individuel, puis VÉRIFIE le résultat.
+ * Renvoie { reserved: boolean, state, reason?, respHtml, verifyHtml }.
+ */
+async function attemptReservation(html, cookieHeader, chosen, dateArrivee) {
+  const payload = buildValidationPayload(html, chosen, {
+    dateArrivee,
+    dateSortie: config.dateSortie,
+  });
+
+  if (!payload) {
+    return { reserved: false, state: 'no-form', reason: 'formulaire de validation introuvable dans le HTML' };
+  }
+
+  console.log(
+    `[reserve-http] POST validation ${chosen.code} — champs remplis par le bot : ${payload.filled.join(', ') || '(aucun)'}` +
+      (payload.stillEmpty.length ? ` | encore vides : ${payload.stillEmpty.join(', ')}` : '')
+  );
+
+  let resp;
+  try {
+    resp = await postForm(URLS.reservation, payload.body, cookieHeader, { referer: URLS.reservation });
+  } catch (err) {
+    return { reserved: false, state: 'network', reason: err.message, payload };
+  }
+
+  const respHtml = resp.html || '';
+  await saveLocal(`reserve_http_validation_${chosen.code}.html`, respHtml);
+
+  const immediate = interpretValidationResult(respHtml);
+
+  // ⚠️ On ne conclut JAMAIS depuis la seule réponse au POST. Même quand elle a
+  // l'air bonne, on relit la page du compte : c'est ce contrôle qui manquait et
+  // qui a produit le faux "✅ RÉSERVATION PROBABLEMENT CONFIRMÉE".
+  const verif = await verifyReservationState(cookieHeader, chosen.code);
+
+  return {
+    reserved: verif.state === 'reserved',
+    state: verif.state,
+    reason: immediate.ok === false ? immediate.reason : verif.error || immediate.reason,
+    immediate,
+    payload,
+    respHtml,
+    verifyHtml: verif.html,
+    status: resp.status,
+  };
+}
+
+/**
  * Traite une dispo à partir du HTML DÉJÀ récupéré par la surveillance.
+ *
  * UN SEUL appel par cycle, quel que soit le nombre de résidences dispos : le
- * HTML contient tout, et c'est ICI qu'on trie pour choisir le bon logement.
+ * HTML les contient toutes, et c'est ICI qu'on trie pour choisir le bon
+ * logement (un T1 en Résidence IV peut légitimement battre un T2 en III — un
+ * traitement résidence par résidence ne saurait pas les départager).
+ *
+ * Le résultat n'est JAMAIS déduit de la seule réponse au POST : on relit la
+ * page du compte, et on bascule au besoin sur un vrai navigateur.
  *
  * @param {string}  html          réponse HTML complète (POST modifier_date_arrivee)
- * @param {string}  cookieHeader  cookie de session (pour le POST de validation)
+ * @param {string}  cookieHeader  cookie de session
  * @param {object}  opts
- * @param {string}  opts.contexte libellé lisible de la dispo (pour les messages d'erreur)
- * @param {boolean} opts.commit   true → tente réellement la validation ; false → détails seuls
- * @returns {Promise<{handled:boolean, reserved?:boolean, chosen?:object}>}
+ * @param {string}  opts.contexte    libellé lisible de la dispo (messages d'erreur)
+ * @param {boolean} opts.commit      true → tente réellement la réservation
+ * @param {string}  opts.dateArrivee date d'arrivée scannée (YYYY-MM-DD)
+ * @param {object[]} opts.residences résidences dispos [{id, label}] (fallback navigateur)
+ * @returns {Promise<{handled:boolean, reserved:boolean, retry?:boolean, chosen?:object}>}
  */
 export async function handleAvailability(html, cookieHeader, opts = {}) {
-  const { contexte = '', commit = false } = opts;
+  const { contexte = '', commit = false, dateArrivee = '', residences = [] } = opts;
+
   const logements = parseLogements(html);
+
   if (logements.length === 0) {
-    // Dispo annoncée par les compteurs mais aucune ligne logement lisible :
-    // structure inattendue → on le signale (et on garde le HTML pour debug).
-    await dumpHtml('reserve_http_no_logement.html', html);
-    await notify(
-      `⚠️ Dispo détectée (${contexte}) mais aucune ligne logement lisible dans le HTML. ` +
-      `HTML sauvegardé pour debug.\n👉 Vérifie à la main : ${URLS.reservation}`
+    // Ce cas se répète à chaque cycle tant que la dispo est annoncée : on le
+    // plafonne pour ne pas transformer une structure inattendue en pluie de
+    // notifications toutes les 3 secondes.
+    const { reservationAttempts, recordReservationAttempt } = await import('./seen.js');
+    const key = `nolog:${contexte}`;
+    if (reservationAttempts(key) >= config.maxReserveAttempts) {
+      console.warn(`[reserve-http] ${key} — déjà signalé ${config.maxReserveAttempts} fois, on se tait.`);
+      return { handled: false, reserved: false, retry: true };
+    }
+    recordReservationAttempt(key);
+
+    await saveLocal('reserve_http_no_logement.html', html);
+    await sendHtml(
+      `⚠️ Dispo annoncée (${escapeHtml(contexte)}) mais aucune ligne logement lisible. ` +
+        `HTML complet ci-joint — c'est la trace à regarder si la structure du site a changé.`,
+      html,
+      'dispo_sans_logement.html'
     );
-    return { handled: false };
+    await notify(
+      `⚠️ Dispo détectée (${escapeHtml(contexte)}) mais aucune ligne logement lisible dans le HTML.\n` +
+        `👉 Vérifie à la main TOUT DE SUITE : ${URLS.reservation}`
+    );
+    // retry:true → on ne considère pas la situation comme traitée, le prochain
+    // cycle réessaiera au lieu de rester muet jusqu'à minuit.
+    return { handled: false, reserved: false, retry: true };
   }
 
-  // Anti-doublon quotidien (par code logement) : on ne retraite QUE les
-  // logements jamais vus aujourd'hui — sinon on re-tenterait la même
-  // réservation refusée toutes les 3 secondes.
-  const { filterNewCodes, markSeen } = await import('./seen.js');
+  const {
+    filterNewCodes, markSeen, reservationAttempts, recordReservationAttempt,
+    markReserved, isReserved,
+  } = await import('./seen.js');
+
   const allCodes = logements.map((l) => l.code);
   const newCodes = filterNewCodes(allCodes);
-  const nouveaux = logements.filter((l) => newCodes.includes(l.code));
-  if (nouveaux.length === 0) {
-    console.log(`[reserve-http] Logement(s) ${allCodes.join(', ')} déjà notifié(s) aujourd'hui.`);
-    return { handled: true };
-  }
-  markSeen(allCodes);
+  const notYetSeen = logements.filter((l) => newCodes.includes(l.code));
+  const isFirstNotification = notYetSeen.length > 0;
 
-  const { candidats, colocSolidaires, horsPrefs } = rankCandidates(nouveaux);
+  // On CLASSE tout ce qui est dispo, pas seulement les nouveautés : un logement
+  // déjà notifié mais toujours pas réservé reste une cible valable (c'était le
+  // trou — "déjà notifié" arrêtait aussi les tentatives).
+  const encoreLibres = logements.filter((l) => !isReserved(l.code));
+  const { candidats, colocSolidaires, horsPrefs } = rankCandidates(encoreLibres);
   const chosen = candidats[0] || null;
 
-  // ── Inventaire envoyé IMMÉDIATEMENT (0 requête réseau, quelques ms). ──────
-  const inventaire = nouveaux.map(formatLogementLigne).join('\n');
-  const entete =
-    nouveaux.length > 1
-      ? `🏠 <b>${nouveaux.length} LOGEMENTS DISPONIBLES !</b>\n\n${inventaire}`
-      : `🏠 <b>Logement disponible !</b>\n\n${formatLogementDetails(nouveaux[0])}`;
+  markSeen(allCodes);
 
-  let verdict;
-  if (!commit) {
-    verdict =
-      `\n\nℹ️ Aucune résidence auto-réservable (${config.autoReserveResidences
-        .map((r) => residenceLabel(r))
-        .join(' / ')}) dans le lot → pas de réservation auto.` +
-      `\n👉 Pour en prendre un : ${URLS.reservation}`;
-  } else if (chosen) {
-    verdict =
-      `\n\n🎯 <b>Choix du bot → ${chosen.code}</b> (${chosen.type}, ${chosen.loyer}, ${chosen.chemin})` +
-      `${nouveaux.length > 1 ? `\n   (meilleur des ${candidats.length} réservables selon tes préférences : ${config.preferredTypes.join(' > ')}, sans colocation)` : ''}` +
-      `\n⏳ Validation en cours…`;
-  } else if (colocSolidaires.length) {
-    verdict = `\n\n🚨 Rien d'auto-réservable : que des colocations solidaires (email colocataire exigé par le site).`;
-  } else {
-    verdict = `\n\nℹ️ Rien d'auto-réservable dans tes résidences/types configurés.`;
+  // ── Inventaire envoyé IMMÉDIATEMENT (0 requête réseau, quelques ms). ──────
+  if (isFirstNotification) {
+    const inventaire = notYetSeen.map(formatLogementLigne).join('\n');
+    const entete =
+      notYetSeen.length > 1
+        ? `🏠 <b>${notYetSeen.length} LOGEMENTS DISPONIBLES !</b>\n\n${inventaire}`
+        : `🏠 <b>Logement disponible !</b>\n\n${formatLogementDetails(notYetSeen[0])}`;
+
+    let verdict;
+    if (!commit) {
+      verdict =
+        `\n\nℹ️ Aucune résidence auto-réservable (${escapeHtml(
+          config.autoReserveResidences.map((r) => residenceLabel(r)).join(' / ')
+        )}) dans le lot → pas de réservation auto.` +
+        `\n👉 Pour en prendre un : ${URLS.reservation}`;
+    } else if (chosen) {
+      verdict =
+        `\n\n🎯 <b>Choix du bot → ${escapeHtml(chosen.code)}</b> (${escapeHtml(chosen.type)}, ` +
+        `${escapeHtml(chosen.loyer)}, ${escapeHtml(chosen.chemin)})` +
+        `${candidats.length > 1 ? `\n   (meilleur des ${candidats.length} réservables selon tes préférences : ${escapeHtml(config.preferredTypes.join(' > '))}, sans colocation)` : ''}` +
+        `\n⏳ Validation en cours, puis vérification sur ton compte…`;
+    } else if (colocSolidaires.length) {
+      verdict = `\n\n🚨 Rien d'auto-réservable : que des colocations solidaires (email colocataire exigé par le site).`;
+    } else {
+      verdict = `\n\nℹ️ Rien d'auto-réservable dans tes résidences/types configurés.`;
+    }
+
+    await notify(entete + verdict);
   }
 
-  await notify(entete + verdict);
-
-  // ── Hors III/IV → on s'arrête après avoir envoyé les détails. ─────────────
+  // ── Hors résidences ciblées → on s'arrête après avoir envoyé les détails. ──
   if (!commit) return { handled: true, reserved: false };
 
   // ── Colocations solidaires : non auto-réservables → alerte manuelle. ──────
-  if (colocSolidaires.length) {
+  if (colocSolidaires.length && isFirstNotification) {
     await notify(
       `🚨🚨 <b>COLOCATION DISPO — ACTION MANUELLE REQUISE</b> 🚨🚨\n\n` +
-      colocSolidaires.map((l) => `${formatLogementDetails(l)}\n`).join('\n') +
-      `\n👥 Le site exige l'email d'un colocataire ayant un compte Césal actif — ` +
-      `le bot ne peut pas réserver seul.\n\n` +
-      `⚡️ <b>SI ÇA T'INTÉRESSE, RÉSERVE TOI-MÊME :</b>\n🔗 ${URLS.reservation}`
+        colocSolidaires.map((l) => `${formatLogementDetails(l)}\n`).join('\n') +
+        `\n👥 Le site exige l'email d'un colocataire ayant un compte Césal actif — ` +
+        `le bot ne peut pas réserver seul.\n\n` +
+        `⚡️ <b>SI ÇA T'INTÉRESSE, RÉSERVE TOI-MÊME :</b>\n🔗 ${URLS.reservation}`
     );
   }
 
-  if (horsPrefs.length) {
+  if (horsPrefs.length && isFirstNotification) {
     await notify(
-      `ℹ️ Écartés par STRICT_TYPES (types hors ${config.preferredTypes.join(', ')}) : ` +
-      horsPrefs.map((l) => `${l.code} (${l.type})`).join(', ') +
-      `\n👉 À prendre à la main si tu veux : ${URLS.reservation}`
+      `ℹ️ Écartés par STRICT_TYPES (types hors ${escapeHtml(config.preferredTypes.join(', '))}) : ` +
+        escapeHtml(horsPrefs.map((l) => `${l.code} (${l.type})`).join(', ')) +
+        `\n👉 À prendre à la main si tu veux : ${URLS.reservation}`
     );
   }
 
   if (!chosen) return { handled: true, reserved: false };
 
-  // ── VALIDATION HTTP DIRECTE, dans l'ordre de préférence. ──────────────────
-  const formFields = parseReservationForm(html);
-  if (!formFields) {
-    await notify(
-      `⚠️ Logement ${chosen.code} sélectionné mais formulaire de validation ` +
-      `introuvable dans le HTML. Réserve à la main tout de suite : ${URLS.reservation}`
-    );
-    return { handled: true, reserved: false };
-  }
+  // ── Tentatives, dans l'ordre de préférence. ──────────────────────────────
+  // Deux garde-fous distincts : le nombre de logements DIFFÉRENTS essayés dans
+  // ce cycle, et le nombre de tentatives par logement et par jour.
+  const aTenter = candidats.slice(0, Math.max(1, config.maxCandidatesPerCycle));
+  let dernier = null;
 
-  const aTenter = candidats.slice(0, Math.max(1, config.maxReserveAttempts));
   for (const [i, cible] of aTenter.entries()) {
-    const details = formatLogementDetails(cible);
-    let result;
-    let respHtml = '';
-    try {
-      const resp = await postValidation(cookieHeader, formFields, cible);
-      respHtml = resp.html || '';
-      // On SAUVEGARDE systématiquement la réponse du POST de validation : le
-      // format exact d'une page "succès" n'a jamais été capturé, donc ce dump
-      // permet d'ajuster interpretValidationResult() dès la première fois.
-      await dumpHtml(`reserve_http_validation_${cible.code}.html`, respHtml);
-      if (resp.status >= 300 && resp.status < 400) {
-        // Une redirection ici est généralement le rechargement post-succès de la
-        // page. On ne peut pas conclure fermement → succès "probable".
-        result = { ok: true, probable: true };
-      } else {
-        result = interpretValidationResult(respHtml);
-      }
-    } catch (err) {
-      await notify(
-        `⚠️ <b>Erreur réseau pendant la validation</b> de ${cible.code} : ` +
-        `<code>${escapeHtml(err.message)}</code>\n👉 Réserve à la main : ${URLS.reservation}`
-      );
+    const attempts = reservationAttempts(cible.code);
+    if (attempts >= config.maxReserveAttempts) {
+      console.warn(`[reserve-http] ${cible.code} — plafond de ${config.maxReserveAttempts} tentatives atteint.`);
       continue;
     }
+    const attemptNo = recordReservationAttempt(cible.code);
+    dernier = cible;
+    const details = formatLogementDetails(cible);
 
-    // ── Envoi du HTML COMPLET de la réponse dès que le résultat n'est PAS un
-    //    succès net (échec, incertain, ou succès seulement "probable"). But :
-    //    voir sur ton téléphone ce qui a pu entraver la réservation (pop-up,
-    //    champ manquant, message serveur…) SANS aucun navigateur.
-    const isSureSuccess = result.ok === true && !result.probable;
-    if (!isSureSuccess) {
+    // ── 1re passe : validation HTTP directe. ───────────────────────────────
+    let result = await attemptReservation(html, cookieHeader, cible, dateArrivee);
+
+    // ── 2e passe : le vrai navigateur, qui exécute le JS du site (remplissage
+    //    du formulaire au clic sur le toggle + popup jquery-confirm de
+    //    confirmation). Déclenchée tant que la réservation n'est PAS constatée
+    //    — y compris sur un état 'unknown'. Arbitrage assumé : dans le pire cas
+    //    le site refuse une seconde demande (il n'accepte qu'une réservation
+    //    par compte), alors que ne rien tenter fait perdre une occasion rare.
+    //    On s'abstient seulement si c'est déjà réservé, ou si la session est
+    //    tombée (il faut se reconnecter).
+    let browserTried = false;
+    if (!result.reserved && result.state !== 'session' && config.browserFallback) {
+      browserTried = true;
+      await notify(
+        `🌐 Validation HTTP sans effet sur ${escapeHtml(cible.code)} — je rejoue le parcours dans un vrai ` +
+          `navigateur (le site remplit le formulaire en JavaScript et ouvre une popup de confirmation).`
+      );
       try {
-        await notifyDocument(
-          `🧾 <b>HTML de la réponse de validation</b> — ${cible.code} (${cible.chemin}).\n` +
-          `À inspecter : pop-up / champ manquant / message serveur ?`,
-          Buffer.from(respHtml, 'utf8'),
-          `validation_${cible.code}.html`
+        const { reserve } = await import('./reserve.js');
+        const cibleResidence =
+          residences.find((r) => r.id === cible.residenceId) ||
+          { id: cible.residenceId, label: residenceLabel(cible.residence) };
+        await reserve([cibleResidence], null, { commit: true, force: true, targetCode: cible.code });
+      } catch (err) {
+        console.warn('[reserve-http] Fallback navigateur en échec:', err.message);
+        await notify(`⚠️ Fallback navigateur en échec : <code>${escapeHtml(err.message)}</code>`);
+      }
+      const verif = await verifyReservationState(cookieHeader, cible.code);
+      result = { ...result, reserved: verif.state === 'reserved', state: verif.state, verifyHtml: verif.html };
+    }
+
+    // ── Traces HTML : envoyées sur Telegram dès que ce n'est pas un succès net.
+    //    C'est la seule copie durable (le disque de la machine Fly ne l'est pas).
+    if (!result.reserved) {
+      await sendHtml(
+        `🧾 <b>Réponse du POST de validation</b> — ${escapeHtml(cible.code)} (tentative ${attemptNo}).\n` +
+          `À inspecter : message serveur, champ manquant, pop-up ?`,
+        result.respHtml,
+        `validation_${cible.code}.html`
+      );
+      await sendHtml(
+        `🧾 <b>Page du compte après tentative</b> — ${escapeHtml(cible.code)}. C'est elle qui fait foi.`,
+        result.verifyHtml,
+        `compte_${cible.code}.html`
+      );
+      if (result.payload) {
+        const diag =
+          `Formulaire : ${result.payload.formId || '(sans id)'}\n` +
+          `Champs remplis par le bot : ${result.payload.filled.join(', ') || '(aucun)'}\n` +
+          `Champs encore vides : ${result.payload.stillEmpty.join(', ') || '(aucun)'}\n\n` +
+          `Corps du POST envoyé :\n${result.payload.body}`;
+        await sendHtml(
+          `🔧 <b>Diagnostic du POST</b> — ${escapeHtml(cible.code)}`,
+          diag,
+          `payload_${cible.code}.txt`
         );
-      } catch (e) {
-        console.warn('[reserve-http] Envoi HTML de validation échoué:', e.message);
       }
     }
 
-    if (result.ok === true) {
+    // ── Verdict. ───────────────────────────────────────────────────────────
+    if (result.reserved) {
+      markReserved(cible.code);
       await notify(
-        `✅✅ <b>RÉSERVATION ${result.probable ? 'PROBABLEMENT ' : ''}CONFIRMÉE !</b> 🎉\n\n` +
-        `${details}\n\n` +
-        (result.probable
-          ? `⚠️ Résultat non 100 % certain côté site — <b>VÉRIFIE</b> (HTML envoyé ci-dessus) : ${URLS.reservation}`
-          : `🔗 Complète ton dossier : ${URLS.reservation}`)
+        `✅✅ <b>RÉSERVATION CONFIRMÉE</b> 🎉\n\n${details}\n\n` +
+          `✔️ Vérifié en relisant la page de ton compte (pas une supposition).\n` +
+          `🔗 Complète ton dossier : ${URLS.reservation}`
       );
       return { handled: true, reserved: true, chosen: cible };
     }
 
+    if (result.state === 'session') {
+      await notify(
+        `🔐 <b>SESSION EXPIRÉE PENDANT LA RÉSERVATION</b> de ${escapeHtml(cible.code)} !\n\n` +
+          `${details}\n\n` +
+          `⚡️ <b>RÉSERVE À LA MAIN TOUT DE SUITE</b> puis relance <code>npm run login</code> :\n🔗 ${URLS.reservation}`
+      );
+      // Session tombée : inutile d'enchaîner sur le logement suivant, tous les
+      // appels échoueraient de la même façon.
+      return { handled: true, reserved: false, retry: true, chosen: cible };
+    }
+
+    const raisonTxt = result.reason ? `\n🛑 <b>Raison :</b> ${escapeHtml(result.reason)}` : '';
     const suivant = aTenter[i + 1];
     const suite = suivant
-      ? `\n\n➡️ J'enchaîne sur le suivant : <b>${suivant.code}</b> (${suivant.type}, ${suivant.loyer}).`
-      : `\n\n⚡️ <b>Réserve à la main TOUT DE SUITE :</b>\n🔗 ${URLS.reservation}`;
+      ? `\n\n➡️ J'enchaîne sur le suivant : <b>${escapeHtml(suivant.code)}</b> (${escapeHtml(suivant.type)}, ${escapeHtml(suivant.loyer)}).`
+      : attemptNo < config.maxReserveAttempts
+        ? `\n🔁 Je retente au prochain cycle (tentative ${attemptNo}/${config.maxReserveAttempts}).`
+        : `\n⛔ Plafond de tentatives atteint — je ne retente plus automatiquement.`;
 
-    if (result.ok === false) {
-      await notify(
-        `❌ <b>RÉSERVATION ÉCHOUÉE</b> (${cible.code}) — le site a refusé.\n\n` +
-        `${details}\n\n🛑 <b>Raison :</b> ${escapeHtml(result.reason || 'inconnue')}` +
-        `\n📎 HTML complet de la réponse envoyé ci-dessus.` + suite
-      );
-    } else {
-      await notify(
-        `⚠️ <b>Réservation — résultat INCERTAIN</b> (${cible.code}, ${escapeHtml(result.reason || '')}).\n\n` +
-        `${details}\n📎 HTML complet de la réponse envoyé ci-dessus.` +
-        `\n👉 <b>VÉRIFIE ET/OU RÉSERVE À LA MAIN :</b>\n🔗 ${URLS.reservation}`
-      );
-      // Résultat indéterminé : on NE tente PAS le suivant — le voeu est
-      // peut-être déjà pris, réserver un 2e logement serait pire que rien.
-      return { handled: true, reserved: false, chosen: cible };
-    }
+    await notify(
+      `❌ <b>RÉSERVATION NON CONFIRMÉE</b> — le logement n'est PAS à toi.\n\n` +
+        `${details}\n${raisonTxt}\n` +
+        `🔎 État du compte après tentative : <code>${escapeHtml(result.state)}</code>` +
+        (browserTried ? ` (fallback navigateur tenté)` : '') +
+        `\n📎 HTML de la réponse + page du compte + payload envoyés ci-dessus.${suite}\n\n` +
+        `⚡️ <b>RÉSERVE À LA MAIN TOUT DE SUITE :</b>\n🔗 ${URLS.reservation}`
+    );
   }
 
-  return { handled: true, reserved: false, chosen };
+  return { handled: true, reserved: false, retry: true, chosen: dernier || chosen };
 }
