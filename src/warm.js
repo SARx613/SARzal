@@ -71,7 +71,35 @@ async function open() {
     await browser.close().catch(() => {});
     throw new Error('SESSION_EXPIRED');
   }
+
+  await markBotTab(page);
+
   return { browser, context, page };
+}
+
+/**
+ * Marque visuellement l'onglet du bot (titre + bandeau rouge) pour qu'il soit
+ * impossible de le confondre avec le tien. Purement cosmétique : le bot
+ * n'utilise aucun de ces éléments pour se repérer, et le bandeau est réinjecté
+ * après chaque navigation (donc jamais un état dont dépendrait la réservation).
+ */
+async function markBotTab(page) {
+  try {
+    await page.evaluate(() => {
+      document.title = '🤖 BOT — NE PAS TOUCHER';
+      if (document.getElementById('__bot_banner__')) return;
+      const b = document.createElement('div');
+      b.id = '__bot_banner__';
+      b.textContent = '🤖 Onglet du bot — ne clique pas ici pendant une réservation';
+      b.style.cssText =
+        'position:fixed;top:0;left:0;right:0;z-index:2147483647;background:#c0392b;' +
+        'color:#fff;font:bold 13px system-ui,sans-serif;text-align:center;padding:6px;' +
+        'pointer-events:none';
+      document.body.appendChild(b);
+    });
+  } catch {
+    // Page pas encore prête / navigation en cours : sans importance.
+  }
 }
 
 /**
@@ -106,6 +134,7 @@ export async function startWarmWindow() {
         if (warm.busy) return;
         try {
           await warm.page.goto(URLS.reservation, { waitUntil: 'domcontentloaded' });
+          await markBotTab(warm.page); // le bandeau ne survit pas à une navigation
           if (/login/i.test(warm.page.url())) log('⚠️ session expirée sur la fenêtre chaude — relance `make login`.');
         } catch (e) {
           log(`rafraîchissement échoué (non bloquant) : ${e.message}`);
@@ -154,6 +183,7 @@ export async function resetWarmWindow() {
   if (!w) return;
   try {
     await w.page.goto(URLS.reservation, { waitUntil: 'domcontentloaded' });
+    await markBotTab(w.page);
   } catch (e) {
     log(`remise à zéro échouée (non bloquant) : ${e.message}`);
   } finally {
