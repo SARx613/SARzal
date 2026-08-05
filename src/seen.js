@@ -18,7 +18,16 @@ import path from 'path';
  *   • `reserved`             = logements réellement confirmés réservés — c'est
  *                              la seule chose qui arrête définitivement le flux.
  */
-const SEEN_FILE = new URL('../config/seen_logements.json', import.meta.url).pathname;
+/**
+ * ⚠️ Surchargeable par SEEN_FILE — uniquement pour que `npm test` écrive dans un
+ * fichier jetable. Sans ça, la suite de tests écrivait dans l'état de PRODUCTION :
+ * elle y laissait `attempts: {"3EC201": 5}` (plafond atteint) et le code marqué
+ * « déjà notifié ». Si ce logement s'était libéré pour de vrai ensuite, le bot
+ * l'aurait considéré comme épuisé et n'aurait **rien tenté** — un lancement de
+ * tests suffisait donc à neutraliser silencieusement la réservation du jour.
+ */
+const SEEN_FILE =
+  process.env.SEEN_FILE || new URL('../config/seen_logements.json', import.meta.url).pathname;
 
 function todayKey() {
   return new Date().toISOString().slice(0, 10); // YYYY-MM-DD

@@ -19,6 +19,16 @@ import assert from 'assert';
 
 const PORT = 8731;
 process.env.CESAL_BASE_URL = `http://127.0.0.1:${PORT}`;
+// État quotidien JETABLE (fourni par npm run test / check-reserve). Sans ça, ce
+// test écrivait dans l'état de PRODUCTION : il y laissait le plafond de
+// tentatives atteint sur 3EC201 et le code marqué « déjà notifié » — de quoi
+// empêcher le bot de tenter quoi que ce soit sur ce logement s'il se libérait
+// ensuite pour de vrai. On refuse de démarrer si ce n'est pas configuré.
+if (!process.env.SEEN_FILE || !/TEST/.test(process.env.SEEN_FILE)) {
+  console.error('❌ SEEN_FILE (fichier de test) non défini — lance `npm test`.');
+  process.exit(1);
+}
+const SEEN_FILE_TEST = process.env.SEEN_FILE;
 process.env.MODE = 'reserve';
 process.env.DATE_SORTIE = '18/12/2026';
 process.env.BROWSER_FALLBACK = 'false'; // pas de Chromium dans un test
@@ -120,9 +130,10 @@ async function scenario(name, fn) {
   messages.length = 0;
   reservationPrise = false;
   dernierPost = null;
-  // État quotidien remis à zéro entre les scénarios.
+  // État quotidien remis à zéro entre les scénarios (fichier de TEST, jamais
+  // celui de production — cf. SEEN_FILE_TEST en haut du fichier).
   const { rmSync } = await import('fs');
-  rmSync(new URL('../config/seen_logements.json', import.meta.url).pathname, { force: true });
+  rmSync(SEEN_FILE_TEST, { force: true });
   try {
     await fn();
     passed++;

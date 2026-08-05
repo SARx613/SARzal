@@ -7,9 +7,9 @@
     "login": "node src/login.js",
     "check": "node src/monitor.js",
     "start": "node src/loop.js",
-    "test": "node src/test-parse.js && node src/test-reservation.js",
-    "test:selection": "node src/test-selection.js",
-    "check-reserve": "node src/test-reservation.js",
+    "test": "SEEN_FILE=config/seen_logements.TEST.json node src/test-parse.js && SEEN_FILE=config/seen_logements.TEST.json node src/test-reservation.js",
+    "test:selection": "SEEN_FILE=config/seen_logements.TEST.json node src/test-selection.js",
+    "check-reserve": "SEEN_FILE=config/seen_logements.TEST.json node src/test-reservation.js",
     "diagnostic": "node src/diagnostic.js"
   },
   "keywords": [],
