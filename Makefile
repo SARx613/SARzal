@@ -1,5 +1,5 @@
 .PHONY: relogin login push-session logs status restart \
-        run run-visible run-alert all stop-local logs-local
+        run run-visible run-alert all stop-local logs-local check-node
 
 # Nom de l'app lu depuis fly.toml (source de vérité unique). Le nom a déjà
 # changé une fois côté Fly, et le codage en dur cassait `make logs/status`.
@@ -7,6 +7,13 @@ APP := $(shell sed -n "s/^app *= *['\"]\(.*\)['\"].*/\1/p" fly.toml | head -1)
 
 # Logs des instances locales. Sous config/, donc déjà hors git.
 LOG_DIR := config/logs
+
+# Le `node` par défaut de ce Mac est un v14 : `fetch` n'y existe pas (arrivé en
+# v18) et TOUTE la surveillance HTTP repose dessus. Lancé avec, le bot planterait
+# à chaque cycle — et on ne veut pas le découvrir le jour où un logement se
+# libère. On refuse donc de démarrer sous Node < 18.
+check-node:
+	@node -e 'const v=+process.versions.node.split(".")[0]; if(v<18){console.error("\n❌ Node "+process.versions.node+" détecté — il faut Node 18+ (fetch).\n   Corrige avec :  nvm use 22\n");process.exit(1)}'
 
 # Enchaîne les 2 commandes du re-login : ouvre le navigateur pour te
 # reconnecter (résous le captcha), puis pousse la nouvelle session sur Fly et
