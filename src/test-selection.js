@@ -272,7 +272,19 @@ globalThis.fetch = async (url, opts = {}) => {
 
 // L'état "déjà vu" et les dumps sont sauvegardés puis restaurés : un test ne
 // doit jamais laisser de trace dans l'état réel du bot.
-const seenPath = new URL('../config/seen_logements.json', import.meta.url).pathname;
+//
+// Ceinture ET bretelles : on écrit dans un fichier JETABLE (SEEN_FILE) plutôt
+// que de compter uniquement sur la restauration en fin de test — un crash au
+// milieu laissait sinon l'état de production pollué (plafond de tentatives
+// atteint sur un logement, qui n'aurait alors plus jamais été tenté).
+// Refus net si l'état jetable n'est pas configuré : mieux vaut un test qui ne
+// démarre pas qu'un test qui plafonne les tentatives dans l'état de production
+// (le bot ne retenterait alors plus ce logement de la journée).
+if (!process.env.SEEN_FILE || !/TEST/.test(process.env.SEEN_FILE)) {
+  console.error('❌ SEEN_FILE (fichier de test) non défini — lance `npm run test:selection`.');
+  process.exit(1);
+}
+const seenPath = process.env.SEEN_FILE;
 const seenBackup = fs.existsSync(seenPath) ? fs.readFileSync(seenPath, 'utf8') : null;
 
 const { handleAvailability } = await import('./reserve-http.js');

@@ -5,3 +5,4 @@ node_modules/
 # (Le dossier est recréé par le Dockerfile et par le code au besoin.)
 config/
 *.har
+config/seen_logements.TEST.json
