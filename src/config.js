@@ -22,6 +22,13 @@ export const config = {
   // ça permet de reprendre la main à la souris si le bot se coince.
   showBrowser: process.env.SHOW_BROWSER === 'true',
 
+  // true → garde en permanence une fenêtre Chromium ouverte, authentifiée et
+  // déjà posée sur la page de réservation (cf. src/warm.js). La surveillance
+  // reste en HTTP pur ; c'est la RÉSERVATION qui démarre alors à chaud, sans
+  // payer les ~2,8 s de lancement de navigateur au pire moment.
+  // À réserver au Mac : le VPS n'a ni écran ni mémoire pour un Chromium résident.
+  warmWindow: process.env.WARM_WINDOW === 'true',
+
   // ── Surveillance rapide (fetch HTTP pur, pas de navigateur permanent) ──────
   // Intervalle de base entre deux checks, en SECONDES — identique jour et nuit
   // (pas de ralentissement nocturne). Défaut 3s ; ajustable via le secret Fly
