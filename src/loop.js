@@ -1,6 +1,7 @@
 import { config, residenceLabel } from './config.js';
 import { checkOnce } from './monitor.js';
 import { notify } from './notify.js';
+import { startWarmWindow } from './warm.js';
 
 /**
  * Résumé des règles de sélection actives — affiché au démarrage (logs Fly ET
@@ -62,6 +63,20 @@ async function loop() {
     `🚀 Moniteur CESAL démarré (mode: ${config.mode}, intervalle ~${config.intervalSeconds}s ±${config.jitterSeconds}s, jour et nuit).` +
       (config.mode === 'reserve' ? `\n\n<b>Règles de choix en cas de dispos multiples :</b>\n${regles}` : '')
   );
+
+  // Fenêtre préchauffée (local, WARM_WINDOW=true) : une fenêtre reste ouverte
+  // sur la page de réservation pour que la réservation démarre à chaud. Ne lève
+  // jamais — si le préchauffage échoue, on réserve à froid comme avant.
+  //
+  // Volontairement PAS attendu : l'ouvrir prend ~6 à 9 s, et la surveillance
+  // n'en a pas besoin pour tourner. L'await ici retardait d'autant le tout
+  // premier check — or c'est précisément au démarrage qu'on rattrape un
+  // logement sorti pendant que le bot était éteint.
+  if (config.warmWindow) {
+    startWarmWindow().then((w) => {
+      if (w) notify('🪟 Fenêtre de réservation préchauffée et prête (démarrage à chaud).');
+    });
+  }
 
   for (;;) {
     const start = Date.now();

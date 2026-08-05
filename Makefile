@@ -1,5 +1,6 @@
 .PHONY: relogin login push-session logs status restart \
-        run run-visible run-alert all stop-local logs-local check-node
+        run run-visible run-warm run-warm-headless run-alert \
+        all stop-local logs-local check-node
 
 # Nom de l'app lu depuis fly.toml (source de vérité unique). Le nom a déjà
 # changé une fois côté Fly, et le codage en dur cassait `make logs/status`.
@@ -48,30 +49,47 @@ restart:
 
 # Surveillance locale, Chromium invisible (même comportement que le VPS).
 # Tourne au premier plan : Ctrl-C pour arrêter.
-run:
+run: check-node
 	INSTANCE_NAME=Mac npm start
 
 # ⭐ Surveillance locale avec Chromium OUVERT à l'écran pour la réservation.
 # Le site (jQuery/select2/AJAX) répond mieux dans une vraie fenêtre, et tu peux
 # reprendre la main à la souris si le bot se coince. Le VPS, lui, n'a aucun
 # affichage : cette cible n'a de sens qu'en local.
-run-visible:
+run-visible: check-node
 	INSTANCE_NAME=Mac-visible SHOW_BROWSER=true npm start
+
+# ⭐⭐ LA cible locale à privilégier : fenêtre Chrome ouverte EN PERMANENCE sur
+# la page de réservation, déjà connectée. La surveillance reste en HTTP pur ;
+# dès qu'un logement sort, la réservation part de cette fenêtre déjà chaude.
+#
+# Mesuré sur cette machine contre le vrai site :
+#   à froid (VPS)      : ~2800 ms avant de pouvoir agir
+#   fenêtre chaude     :    ~14 ms   (le démarrage est payé au lancement)
+run-warm: check-node
+	INSTANCE_NAME=Mac-chaud SHOW_BROWSER=true WARM_WINDOW=true npm start
+
+# Idem, mais la fenêtre préchauffée reste invisible (si tu ne veux pas d'une
+# fenêtre Chrome ouverte à l'écran toute la journée). Même gain de temps.
+run-warm-headless: check-node
+	INSTANCE_NAME=Mac-chaud WARM_WINDOW=true npm start
 
 # Surveillance locale en ALERTE SEULE : notifie, ne réserve jamais.
 # Le filet sans le risque de double réservation.
-run-alert:
+run-alert: check-node
 	INSTANCE_NAME=Mac-alerte MODE=alert npm start
 
-# Lance les deux instances locales en ARRIÈRE-PLAN (visible + invisible), en
-# plus du VPS. `make logs-local` pour suivre, `make stop-local` pour arrêter.
-all:
+# Lance l'instance locale À CHAUD en ARRIÈRE-PLAN, en plus du VPS.
+# Une seule instance locale (pas deux) : deux fenêtres Chromium résidentes ne
+# doublent pas les chances, elles doublent surtout la RAM et le risque que les
+# deux tentent de réserver le même logement.
+# `make logs-local` pour suivre, `make stop-local` pour arrêter.
+all: check-node
 	@mkdir -p $(LOG_DIR)
-	@INSTANCE_NAME=Mac nohup npm start > $(LOG_DIR)/mac.log 2>&1 & \
-	  echo "  ▶ Mac (invisible) → $(LOG_DIR)/mac.log"
-	@INSTANCE_NAME=Mac-visible SHOW_BROWSER=true nohup npm start > $(LOG_DIR)/mac-visible.log 2>&1 & \
-	  echo "  ▶ Mac-visible     → $(LOG_DIR)/mac-visible.log"
-	@echo "  ▶ VPS             → déjà en route (make status)"
+	@INSTANCE_NAME=Mac-chaud SHOW_BROWSER=true WARM_WINDOW=true \
+	  nohup npm start > $(LOG_DIR)/mac.log 2>&1 & \
+	  echo "  ▶ Mac (fenêtre chaude) → $(LOG_DIR)/mac.log"
+	@echo "  ▶ VPS (à froid)        → déjà en route (make status)"
 	@echo ""
 	@echo "Suivre : make logs-local   |   Arrêter : make stop-local"
 
