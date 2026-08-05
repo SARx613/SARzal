@@ -123,9 +123,12 @@ export function parseLogements(html) {
       else break;
     }
 
-    // <input type="hidden" id="message_affectation_XXX" value="La date de fin de
-    // bail maximale autorisée…"> : le site le recopie dans le formulaire final.
-    const msg = rowHtml.match(/id="message_affectation_[^"]*"[^>]*/i);
+    // <input type="hidden" id="message_affectation_XXX" name="…" value="La date
+    // de fin de bail maximale autorisée…"> : le site le recopie dans le
+    // formulaire final. On accepte `id` OU `name` : l'ordre des attributs et
+    // leur présence varient d'un tableau à l'autre, et ne matcher que `id`
+    // faisait silencieusement perdre la valeur.
+    const msg = rowHtml.match(/<input\b[^>]*\b(?:id|name)="message_affectation_[^"]*"[^>]*>/i);
     const messageAffectation = msg ? decodeEntities(attr(msg[0], 'value') || '') : '';
 
     result.push({
