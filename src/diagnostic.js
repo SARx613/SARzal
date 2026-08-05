@@ -66,15 +66,24 @@ async function main() {
   ok('Session présente', `${cookieHeader.split(';').length} cookie(s)`);
 
   /* ── 2. La page de réservation répond-elle ? ────────────────────────────── */
-  const body = new URLSearchParams({
-    action: 'modifier_date_arrivee',
-    date_arrivee: '',
-    date_sortie: config.dateSortie,
-  }).toString();
-
+  // ⚠️ Tant qu'aucune date d'arrivée n'est choisie, le site n'envoie qu'un
+  // squelette (~31 Ko) : « merci de nous indiquer votre date d'arrivée ». Ni
+  // résidences, ni logements, ni formulaire de validation n'y figurent. Poster
+  // une date VIDE faisait donc crier au loup — c'est la page normale d'avant
+  // sélection. On refait ici ce que fait la surveillance : lire les dates
+  // proposées, puis reposter avec la dernière (celle qui ouvre le plus loin).
   let res;
   try {
-    res = await postForm(URLS.reservation, body, cookieHeader, { referer: URLS.reservation });
+    res = await postForm(
+      URLS.reservation,
+      new URLSearchParams({
+        action: 'modifier_date_arrivee',
+        date_arrivee: '',
+        date_sortie: config.dateSortie,
+      }).toString(),
+      cookieHeader,
+      { referer: URLS.reservation }
+    );
   } catch (err) {
     ko('Le site ne répond pas', err.message);
     await envoyerBilan();
@@ -88,6 +97,33 @@ async function main() {
   }
   ok('Page de réservation accessible', `HTTP ${res.status}, ${res.html.length} caractères`);
 
+  const dates = parseArrivalDates(res.html);
+  if (dates.length === 0) ko('Aucune date d\'arrivée lisible', 'le <select date_arrivee> a changé');
+  else ok('Dates d\'arrivée lues', `${dates.length} date(s), la dernière = ${dates[dates.length - 1]}`);
+
+  // Sélection de la date → c'est CETTE réponse qui contient tout le reste.
+  if (dates.length) {
+    const derniere = dates[dates.length - 1];
+    try {
+      const avecDate = await postForm(
+        URLS.reservation,
+        new URLSearchParams({
+          action: 'modifier_date_arrivee',
+          date_arrivee: derniere,
+          date_sortie: config.dateSortie,
+        }).toString(),
+        cookieHeader,
+        { referer: URLS.reservation }
+      );
+      if (!looksLikeLogin(avecDate.html) && avecDate.html.length > res.html.length) {
+        res = avecDate;
+        ok('Page complète après choix de la date', `${derniere} → ${res.html.length} caractères`);
+      }
+    } catch (err) {
+      ko('Sélection de la date impossible', err.message);
+    }
+  }
+
   /* ── 3. La surveillance voit-elle quelque chose ? ───────────────────────── */
   const nodes = parseAvailability(res.html);
   const nbNodes = Object.keys(nodes).length;
@@ -98,10 +134,6 @@ async function main() {
     ok('Statuts de résidence lus', `${nbNodes} nœuds, ${dispo.length} résidence(s) avec dispo`);
     if (dispo.length) info('Résidences disponibles', dispo.map(([id]) => id).join(', '));
   }
-
-  const dates = parseArrivalDates(res.html);
-  if (dates.length === 0) ko('Aucune date d\'arrivée lisible', 'le <select date_arrivee> a changé');
-  else ok('Dates d\'arrivée lues', `${dates.length} date(s), la dernière = ${dates[dates.length - 1]}`);
 
   /* ── 4. LE POINT LE PLUS IMPORTANT : la vérification sait-elle lire ton
    *      compte ? C'est elle qui décide si un « ✅ » est envoyé ou non. Si elle
@@ -133,7 +165,15 @@ async function main() {
   /* ── 5. Le formulaire de validation est-il là, et complet ? ─────────────── */
   const form = parseValidationForm(res.html);
   if (!form) {
-    ko('Formulaire de validation introuvable', 'le bot ne pourrait pas réserver en HTTP (il basculerait sur le navigateur)');
+    // Le formulaire n'existe dans le HTML qu'une fois une date choisie ; s'il
+    // manque encore ici, c'est soit qu'aucune date n'était sélectionnable, soit
+    // que le site a changé. Sans dispo du jour, ce n'est pas un défaut du bot.
+    ko(
+      'Formulaire de validation introuvable',
+      dates.length
+        ? 'même après avoir choisi une date — le bot basculerait sur le navigateur'
+        : 'aucune date d\'arrivée n\'était sélectionnable, donc le site ne l\'affiche pas'
+    );
   } else {
     const noms = form.fields.map((f) => f.name);
     ok('Formulaire de validation trouvé', `id="${form.id || '(sans id)'}", ${noms.length} champ(s)`);
