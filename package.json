@@ -6,7 +6,10 @@
   "scripts": {
     "login": "node src/login.js",
     "check": "node src/monitor.js",
-    "start": "node src/loop.js"
+    "start": "node src/loop.js",
+    "test": "node src/test-parse.js && node src/test-reservation.js",
+    "check-reserve": "node src/test-reservation.js",
+    "diagnostic": "node src/diagnostic.js"
   },
   "keywords": [],
   "author": "",
