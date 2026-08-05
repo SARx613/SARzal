@@ -1,6 +1,7 @@
 import fs from 'fs';
 import { config, URLS, STORAGE_STATE } from './config.js';
 import { notify, escapeHtml } from './notify.js';
+import { postForm, looksLikeLogin } from './http.js';
 
 /**
  * Stratégie (déduite du HAR réel) :
@@ -60,6 +61,42 @@ function resetSessionAlertCount() {
   sessionAlertCount = 0;
 }
 
+/**
+ * Écrit une réponse HTML dans config/ pour debug. Best-effort : le dossier peut
+ * ne pas exister et, sur Fly, le disque est de toute façon éphémère — cette
+ * sauvegarde ne doit jamais faire échouer un cycle de surveillance.
+ */
+function dumpResponse(filename, html) {
+  try {
+    const dir = new URL('../config/', import.meta.url).pathname;
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(dir + filename, html);
+  } catch (err) {
+    console.warn('[check] Dump HTML impossible (non bloquant):', err.message);
+  }
+}
+
+/**
+ * Le HTML ne contient plus aucun statut de résidence : soit le site a changé de
+ * structure, soit il renvoie autre chose que la page attendue. Dans les deux cas
+ * le bot est AVEUGLE et laisserait passer une dispo sans rien dire — donc on
+ * alerte, avec le HTML en pièce jointe (seule copie durable).
+ */
+let structureAlertCount = 0;
+async function notifyStructureIssue(html) {
+  structureAlertCount++;
+  if (structureAlertCount > 3) return; // pas de spam si ça dure
+  const { notifyDocument } = await import('./notify.js');
+  await notify(
+    `🛑 <b>SURVEILLANCE AVEUGLE</b> — la page CESAL ne contient plus aucun statut de résidence ` +
+    `lisible (structure changée ?). Tant que ce n'est pas corrigé, je peux <b>rater une dispo</b>.\n` +
+    `📎 HTML de la réponse en pièce jointe.\n👉 Vérifie à la main : ${URLS.reservation}`
+  );
+  try {
+    await notifyDocument('🧾 Réponse CESAL non reconnue', Buffer.from(html || '', 'utf8'), 'reponse_inconnue.html');
+  } catch {}
+}
+
 /** Lit le cookie de session capturé par Playwright (config/session.json). */
 function loadCookieHeader() {
   if (!fs.existsSync(STORAGE_STATE)) return null;
@@ -115,9 +152,12 @@ function availableResidences(nodes) {
 
 /**
  * Résidences pour lesquelles on AUTO-RÉSERVE (les autres → notification seule).
- * Choix utilisateur : uniquement Résidence III et Résidence IV.
+ * Par défaut Résidence III et IV, ajustable via AUTO_RESERVE_RESIDENCES sans
+ * redéployer (ex: "3,4,5").
  */
-const AUTO_RESERVE_RESIDENCE_IDS = new Set(['residence_3', 'residence_4']);
+const AUTO_RESERVE_RESIDENCE_IDS = new Set(
+  config.autoReserveResidences.map((n) => `residence_${n}`)
+);
 
 /**
  * Construit le texte de notification hiérarchisé :
@@ -202,20 +242,9 @@ async function fetchReservationPage(cookieHeader, dateArrivee) {
     dateArrivee: dateArrivee || '',
     dateSortie: config.dateSortie,
   });
-  const res = await fetch(URLS.reservation, {
-    method: 'POST',
-    redirect: 'manual',
-    headers: {
-      'content-type': 'application/x-www-form-urlencoded',
-      origin: 'https://logement.cesal.fr',
-      referer: URLS.reservation,
-      'user-agent':
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36',
-      cookie: cookieHeader,
-    },
-    body,
-  });
-  return res;
+  // En-têtes mutualisés avec le POST de validation (cf. src/http.js) : la
+  // surveillance et la réservation doivent être indiscernables côté serveur.
+  return postForm(URLS.reservation, body, cookieHeader, { referer: URLS.reservation });
 }
 
 export async function checkOnce() {
@@ -255,10 +284,10 @@ export async function checkOnce() {
     }
   }
 
-  let html = await res.text();
+  let html = res.html;
 
   // Page de login renvoyée directement (autre forme d'expiration).
-  if (/g-recaptcha|name="login-email"/.test(html) && !/id="residences"/.test(html)) {
+  if (looksLikeLogin(html)) {
     await notifySessionIssue('🔐 Session CESAL expirée. Relance <code>npm run login</code>.');
     return { error: 'SESSION_EXPIRED' };
   }
@@ -275,33 +304,41 @@ export async function checkOnce() {
     if (selected !== lastDate) {
       try {
         const res2 = await fetchReservationPage(cookieHeader, lastDate);
-        html = await res2.text();
+        if (res2.html) html = res2.html;
       } catch (err) {
         console.warn('[check] Re-scan avec dernière date échoué, on garde le 1er résultat:', err.message);
       }
     }
     console.log(`[check] Date d'arrivée scannée : ${lastDate}`);
   }
+  // Date réellement utilisée pour le scan : c'est celle qu'il faudra remettre
+  // dans le formulaire de réservation (sinon le serveur voit une incohérence
+  // entre le logement proposé et la date demandée).
+  const scannedDate = lastDate || '';
 
   const nodes = parseAvailability(html);
   if (Object.keys(nodes).length === 0) {
     console.warn('[check] Aucun statut parsé — la structure a peut-être changé. HTML dump.');
-    fs.writeFileSync(
-      new URL('../config/last_response.html', import.meta.url).pathname,
-      html
-    );
+    dumpResponse('last_response.html', html);
+    // Structure inconnue = bot AVEUGLE : il ne verrait plus passer une dispo.
+    // On alerte (une fois, comme les problèmes de session) avec le HTML joint.
+    await notifyStructureIssue(html);
     return { error: 'NO_NODES' };
   }
 
   const dispoResidences = availableResidences(nodes);
 
   if (dispoResidences.length > 0) {
-    // ── ANTI-SPAM ────────────────────────────────────────────────────────────
-    // Signature = ensemble trié des niveaux disponibles (détectés en HTTP, sans
-    // navigateur). Tant qu'elle ne change pas, on a déjà traité cette situation
-    // aujourd'hui : on n'envoie AUCUN message et on n'ouvre PAS le navigateur
-    // (évite le spam de 15 notifs + screenshots à chaque cycle de 3 min). Une
-    // nouvelle dispo (autre niveau) change la signature et relance le flux.
+    // ── ANTI-SPAM DE NOTIFICATION ────────────────────────────────────────────
+    // Signature = ensemble trié des niveaux disponibles. Tant qu'elle ne change
+    // pas, on ne renvoie pas le gros message d'alerte.
+    //
+    // ⚠️ Correction majeure : cette signature ne coupe PLUS la réservation. Avant,
+    // "déjà notifié" voulait dire "déjà traité" — donc une tentative ratée au
+    // premier cycle laissait le bot muet ET inactif jusqu'à minuit, sur un
+    // logement pourtant toujours libre. Désormais elle ne fait taire que le
+    // message ; les tentatives, elles, continuent (plafonnées par logement dans
+    // reserve-http.js) tant que rien n'est réellement réservé.
     const { isNewSignature, markSignatureSeen } = await import('./seen.js');
     const dispoLevels = Object.entries(nodes)
       .filter(([id, v]) => v.available && /^niveau_/.test(id))
@@ -310,66 +347,71 @@ export async function checkOnce() {
     // Repli : si aucun niveau parsé (structure inattendue), on retombe sur les
     // résidences dispo pour ne pas perdre l'alerte.
     const signature = (dispoLevels.length ? dispoLevels : dispoResidences.map((r) => r.id).sort()).join('|');
-    if (!isNewSignature(signature)) {
-      console.log(`[check] Signature déjà traitée aujourd'hui (${signature}) — pas de nouvelle notif.`);
-      return { available: true, alreadyNotified: true, nodes };
-    }
-    markSignatureSeen(signature);
+    const firstTime = isNewSignature(signature);
+    if (firstTime) markSignatureSeen(signature);
 
-    // On ne RÉSERVE réellement que pour les Résidences III / IV. Pour les autres,
-    // on ouvre quand même le navigateur pour prendre les captures (documentation),
-    // mais sans jamais cliquer "Réserver"/"Valider" (commit=false).
+    // On ne RÉSERVE réellement que pour les résidences ciblées (III/IV par
+    // défaut). Pour les autres, on se contente des détails du logement.
     const autoResidences = dispoResidences.filter((r) =>
       AUTO_RESERVE_RESIDENCE_IDS.has(r.id)
     );
     const isEligible = autoResidences.length > 0;
-    // Résidences vers lesquelles diriger la navigation : III/IV en priorité,
-    // sinon la 1re dispo (pour les captures uniquement).
     const targetResidences = isEligible ? autoResidences : dispoResidences;
 
-    // Message d'alerte — différent selon qu'on va réserver ou juste documenter.
-    if (isEligible) {
+    // Message d'alerte — envoyé une seule fois par signature.
+    if (firstTime) {
+      const cibles = config.autoReserveResidences.join('/');
       await notify(
-        `🏠 <b>LOGEMENT DISPONIBLE CHEZ CESAL !</b>\n\n` +
-        buildDispoMessage(dispoResidences, nodes) +
-        `\n\n🎯 <b>Résidence III/IV détectée → le bot analyse le logement.</b>` +
-        `\n   • Logement individuel → il réserve automatiquement.` +
-        `\n   • Colocation (email colocataire exigé par le site) → il NE PEUT PAS,` +
-        ` il t'alerte pour que tu réserves à la main.` +
-        `\n⚡ <b>EN BACKUP, réserve TOI AUSSI à la main tout de suite :</b>` +
-        `\n🔗 ${URLS.reservation}`
+        isEligible
+          ? `🏠 <b>LOGEMENT DISPONIBLE CHEZ CESAL !</b>\n\n` +
+              buildDispoMessage(dispoResidences, nodes) +
+              `\n\n🎯 <b>Résidence ciblée détectée → le bot analyse le logement.</b>` +
+              `\n   • Logement individuel → il tente la réservation, PUIS il relit ton` +
+              ` compte pour vérifier qu'elle a vraiment été prise.` +
+              `\n   • Colocation (email colocataire exigé par le site) → il NE PEUT PAS,` +
+              ` il t'alerte pour que tu réserves à la main.` +
+              `\n⚡ <b>EN BACKUP, réserve TOI AUSSI à la main tout de suite :</b>` +
+              `\n🔗 ${URLS.reservation}`
+          : `🏠 <b>LOGEMENT DISPONIBLE CHEZ CESAL !</b>\n\n` +
+              buildDispoMessage(dispoResidences, nodes) +
+              `\n\nℹ️ <b>Hors résidences ciblées (${escapeHtml(cibles)})</b> → je ne réserve PAS,` +
+              ` je récupère juste les détails du logement (prix, surface, colocation…).` +
+              `\n👉 Si ça t'intéresse, réserve à la main :` +
+              `\n🔗 ${URLS.reservation}`
       );
     } else {
-      await notify(
-        `🏠 <b>LOGEMENT DISPONIBLE CHEZ CESAL !</b>\n\n` +
-        buildDispoMessage(dispoResidences, nodes) +
-        `\n\nℹ️ <b>Ce n'est PAS une Résidence III/IV</b> → je ne réserve PAS,` +
-        ` je récupère juste les détails du logement (prix, surface, colocation…).` +
-        `\n👉 Si ça t'intéresse, réserve à la main :` +
-        `\n🔗 ${URLS.reservation}`
-      );
+      console.log(`[check] Signature déjà notifiée (${signature}) — pas de nouveau message, mais on continue le traitement.`);
     }
 
-    // ── RÉSERVATION 100 % HTTP (aucun navigateur) ────────────────────────────
-    // Tout le détail des logements ET le formulaire de validation sont DÉJÀ dans
-    // le `html` qu'on vient de récupérer (le parcours du site est 100 % côté
-    // client — cf. reserve-http.js). On traite donc chaque résidence cible en
-    // quelques millisecondes, sans ouvrir Chromium. commit=true seulement pour
-    // III/IV (validation réelle) ; les autres → détails seuls.
-    // Nécessite le mode reserve (sinon on se contente de l'alerte ci-dessus).
+    // ── RÉSERVATION ──────────────────────────────────────────────────────────
+    // Tout le détail des logements ET le formulaire de validation sont déjà dans
+    // le `html` qu'on vient de récupérer. On tente d'abord en HTTP pur, puis on
+    // VÉRIFIE le compte ; si rien n'a été pris, reserve-http bascule sur un vrai
+    // navigateur (qui exécute le JS du site et sa popup de confirmation).
     if (config.mode === 'reserve') {
       const { handleAvailability } = await import('./reserve-http.js');
       for (const res of targetResidences) {
         const chemin = buildChemin(res, nodes);
         try {
-          await handleAvailability(html, cookieHeader, chemin, { commit: isEligible });
+          await handleAvailability(html, cookieHeader, {
+            residence: res,
+            chemin,
+            commit: isEligible,
+            dateArrivee: scannedDate,
+          });
         } catch (err) {
+          console.error('[check] Traitement en échec:', err);
           await notify(
-            `⚠️ Traitement (${res.label}) en échec : <code>${escapeHtml(err.message)}</code>\n` +
+            `⚠️ Traitement (${escapeHtml(res.label)}) en échec : <code>${escapeHtml(err.message)}</code>\n` +
             `👉 Réserve à la main si besoin : ${URLS.reservation}`
           );
         }
       }
+    } else if (firstTime && isEligible) {
+      await notify(
+        `ℹ️ <b>MODE=alert</b> : le bot ne réserve pas automatiquement. ` +
+        `Passe MODE=reserve si tu veux qu'il tente la réservation.`
+      );
     }
     return { available: true, autoReserved: isEligible, nodes };
   }

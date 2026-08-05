@@ -249,8 +249,19 @@ async function launchBrowser() {
   }
 }
 
+/**
+ * @param {{commit?: boolean, force?: boolean, targetCode?: string|null}} opts
+ *   commit=true    → va jusqu'à "Valider votre réservation".
+ *   force=true     → ignore l'anti-doublon quotidien. Indispensable quand ce
+ *                    flux est appelé en RATTRAPAGE d'une validation HTTP qui
+ *                    n'a pas abouti : les codes ont déjà été marqués "notifiés"
+ *                    par le premier essai, et sans ce drapeau on repartirait
+ *                    aussitôt sans rien tenter.
+ *   targetCode     → réserver précisément ce logement (et pas simplement le
+ *                    premier de la liste).
+ */
 export async function reserve(dispoResidences, _nodes, opts = {}) {
-  const { commit = true } = opts;
+  const { commit = true, force = false, targetCode = null } = opts;
   await notify('🌐 Ouverture du navigateur pour la réservation…');
   const browser = await launchBrowser();
   browser.on('disconnected', () => console.warn('[reserve] Événement: navigateur déconnecté'));
@@ -409,16 +420,20 @@ export async function reserve(dispoResidences, _nodes, opts = {}) {
     }
 
     // Anti-doublon quotidien : on ne re-notifie pas les mêmes codes le même jour.
+    // `force` le court-circuite (rattrapage d'une validation HTTP non aboutie).
     const { filterNewCodes, markSeen } = await import('./seen.js');
     const newCodes = filterNewCodes(logements.map((l) => l.code));
     const notYetSeen = logements.filter((l) => newCodes.includes(l.code));
-    if (notYetSeen.length === 0) {
+    if (notYetSeen.length === 0 && !force) {
       await notify(
         `ℹ️ <b>${chemin}</b> : logement(s) ${logements.map((l) => l.code).join(', ')} déjà notifié(s) aujourd'hui → pas de nouvelle alerte${commit ? ', pas de re-réservation' : ''}.`
       );
       return;
     }
-    const chosen = notYetSeen[0];
+    // Si un code précis est demandé (rattrapage), c'est LUI qu'on prend — pas
+    // le premier venu, qui pourrait être un autre logement du même niveau.
+    const pool = notYetSeen.length ? notYetSeen : logements;
+    const chosen = (targetCode && logements.find((l) => l.code === targetCode)) || pool[0];
     const details = formatLogementDetails(chosen);
     markSeen(logements.map((l) => l.code));
 
@@ -432,15 +447,19 @@ export async function reserve(dispoResidences, _nodes, opts = {}) {
       ? `\n\n📋 <b>Tous les logements dispo ici</b> (${logements.length}) : ` +
         logements.map((l) => `${l.code} (${l.type}, ${l.loyer})`).join(', ')
       : '';
-    await notify(
-      `🏠 <b>Logement disponible !</b>\n\n` +
-      `📍 ${chemin}\n\n` +
-      `${details}` +
-      logementsListe +
-      (commit
-        ? `\n\n🎯 Résidence III/IV → je tente la réservation auto…`
-        : `\n\nℹ️ Résidence hors III/IV → je ne valide PAS.\n👉 Pour la prendre, réserve à la main : ${URLS.reservation}`)
-    );
+    // En rattrapage (`force`), les détails ont déjà été envoyés par le flux HTTP :
+    // on ne renvoie pas deux fois le même message.
+    if (notYetSeen.length > 0) {
+      await notify(
+        `🏠 <b>Logement disponible !</b>\n\n` +
+        `📍 ${chemin}\n\n` +
+        `${details}` +
+        logementsListe +
+        (commit
+          ? `\n\n🎯 Résidence ciblée → je tente la réservation auto…`
+          : `\n\nℹ️ Hors résidences ciblées → je ne valide PAS.\n👉 Pour la prendre, réserve à la main : ${URLS.reservation}`)
+      );
+    }
 
     await screenshot('I', `Tableau des logements — ${chosen.code}`);
 
@@ -541,30 +560,38 @@ export async function reserve(dispoResidences, _nodes, opts = {}) {
     await page.waitForTimeout(2500);
     await screenshot('K', 'Après validation — résultat final', { toTelegram: true });
 
-    // Après soumission réussie, la page "Mon logement" doit indiquer un bien
-    // réservé/en cours. Si le message "aucun bien en location ou réservé" est
-    // encore là (ou une erreur), la réservation n'a pas abouti.
-    const finalText = (await page.locator('body').textContent().catch(() => '')) || '';
-    const stillNothing = /aucun bien en location ou r.serv/i.test(finalText);
-    const errorAfter =
-      (await errorBox.isVisible().catch(() => false)) ||
-      /validation des informations impossible/i.test(finalText);
+    // ── VÉRIFICATION FINALE ──────────────────────────────────────────────────
+    // On RECHARGE la page du compte et on l'interprète avec exactement la même
+    // fonction que le flux HTTP (interpretAccountPage). Le principe posé après
+    // l'audit : un ✅ n'est envoyé que si l'état du compte le prouve. Ni
+    // l'absence d'erreur, ni une redirection, ni un écran qui « a l'air bon »
+    // ne valent confirmation.
+    await page.goto(URLS.reservation, { waitUntil: 'domcontentloaded' }).catch(() => {});
+    await page.waitForTimeout(1500);
+    const finalHtml = (await page.content().catch(() => '')) || '';
+    const { interpretAccountPage } = await import('./reserve-http.js');
+    const state = interpretAccountPage(finalHtml, chosen.code);
 
-    if (errorAfter || stillNothing) {
-      await dumpHtml('K_ECHEC');
+    if (state === 'reserved') {
+      const { markReserved } = await import('./seen.js');
+      markReserved(chosen.code);
       await notify(
-        `❌ <b>RÉSERVATION NON CONFIRMÉE</b> après validation.\n\n` +
-        `📍 ${chemin}\n${details}\n\n` +
-        `👉 <b>RÉSERVE À LA MAIN TOUT DE SUITE :</b>\n🔗 ${URLS.reservation}`
+        `✅✅ <b>RÉSERVATION CONFIRMÉE !</b> 🎉\n\n` +
+        `📍 ${chemin}\n\n` +
+        `${details}\n\n` +
+        `✔️ Vérifié en relisant la page de ton compte.\n` +
+        `🔗 Vérifie/complète ton dossier : ${URLS.reservation}`
       );
       return;
     }
 
+    await dumpHtml('K_NON_CONFIRME');
     await notify(
-      `✅✅ <b>RÉSERVATION CONFIRMÉE !</b> 🎉\n\n` +
-      `📍 ${chemin}\n\n` +
-      `${details}\n\n` +
-      `🔗 Vérifie/complète ton dossier : ${URLS.reservation}`
+      `❌ <b>RÉSERVATION NON CONFIRMÉE</b> après validation (état du compte : ` +
+      `<code>${escapeHtml(state)}</code>).\n\n` +
+      `📍 ${chemin}\n${details}\n\n` +
+      `📎 HTML de la page du compte envoyé ci-dessus.\n` +
+      `👉 <b>RÉSERVE À LA MAIN TOUT DE SUITE :</b>\n🔗 ${URLS.reservation}`
     );
 
   } catch (err) {
