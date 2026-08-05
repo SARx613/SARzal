@@ -31,8 +31,8 @@ export const config = {
   // Quand PLUSIEURS logements sont dispos en même temps (cas réel attendu),
   // il faut choisir. Tout est pilotable par secret Fly, sans redéployer.
 
-  // Résidences pour lesquelles on VALIDE réellement (les autres = alerte seule).
-  // Ex: "3,4". L'ordre compte : sert de départage à qualité égale.
+  // Résidences pour lesquelles on RÉSERVE vraiment (les autres = alerte seule).
+  // Ex: "3,4". L'ORDRE compte : sert de départage à qualité égale.
   autoReserveResidences: (process.env.AUTO_RESERVE_RESIDENCES || '3,4')
     .split(',')
     .map((s) => s.trim())
@@ -56,9 +56,21 @@ export const config = {
   // Défaut false : tu veux du sans-colocation. Ces logements restent notifiés.
   allowColocNonSolidaire: process.env.ALLOW_COLOC_NON_SOLIDAIRE === 'true',
 
-  // Nombre max de logements différents tentés dans un même cycle si les
+  // Nombre max de logements DIFFÉRENTS tentés dans un même cycle si les
   // premiers échouent (garde-fou : on ne martèle pas le serveur).
-  maxReserveAttempts: parseInt(process.env.MAX_RESERVE_ATTEMPTS || '3', 10),
+  maxCandidatesPerCycle: parseInt(process.env.MAX_CANDIDATES_PER_CYCLE || '3', 10),
+
+  // Nombre maximum de tentatives de réservation SUR UN MÊME logement, par jour.
+  // Une tentative ratée NE clôt plus l'affaire (c'était le bug : une occasion
+  // rare était abandonnée sur un simple échec technique), mais on ne martèle
+  // pas non plus le site indéfiniment.
+  maxReserveAttempts: parseInt(process.env.MAX_RESERVE_ATTEMPTS || '5', 10),
+
+  // Si la validation HTTP n'aboutit pas et que le compte n'a rien de réservé,
+  // rejouer le parcours dans un vrai navigateur (le site remplit son formulaire
+  // en JavaScript et confirme via une popup). Mettre à "false" sur une machine
+  // trop petite pour Chromium.
+  browserFallback: process.env.BROWSER_FALLBACK !== 'false',
 };
 
 /** Libellés lisibles des résidences (partagés monitor / reserve). */
@@ -76,10 +88,15 @@ export function residenceLabel(num) {
   return RESIDENCE_LABELS[num] || `Résidence ${num}`;
 }
 
+// Base du site. Surchargeable par CESAL_BASE_URL — uniquement pour pouvoir
+// rejouer le parcours complet contre un faux serveur local dans les tests
+// (cf. src/test-reservation.js). En production, on ne la définit pas.
+const BASE = (process.env.CESAL_BASE_URL || 'https://logement.cesal.fr').replace(/\/$/, '');
+
 export const URLS = {
-  login: 'https://logement.cesal.fr/espace-resident/cesal_login.php',
-  index: 'https://logement.cesal.fr/espace-resident/index.php',
-  reservation: 'https://logement.cesal.fr/espace-resident/cesal_mon_logement_reservation.php',
+  login: `${BASE}/espace-resident/cesal_login.php`,
+  index: `${BASE}/espace-resident/index.php`,
+  reservation: `${BASE}/espace-resident/cesal_mon_logement_reservation.php`,
 };
 
 // Fichier où l'état de session (cookies) est stocké après un login réussi.

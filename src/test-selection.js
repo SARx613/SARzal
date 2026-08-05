@@ -27,6 +27,7 @@ import {
   isColocation,
   isSolidaire,
 } from './reserve-http.js';
+import { config } from './config.js';
 
 let failures = 0;
 function check(label, actual, expected) {
@@ -201,10 +202,16 @@ console.log('\n   → Ancien comportement (1re ligne du document, sans filtre) :
   `${logements[0].code} en ${logements[0].chemin} ⛔`);
 
 console.log('\n═══ 3. Payload POST envoyé pour le logement choisi ═══\n');
-const formFields = parseReservationForm(html);
-const payload = buildValidationPayload(formFields, candidats[0]);
+// buildValidationPayload part désormais du HTML complet (il doit émuler ce que
+// le JS du site pose dans le formulaire) et renvoie { body, filled, … }.
+const payloadRes = buildValidationPayload(html, candidats[0], {
+  dateArrivee: '21/08/2026',
+  dateSortie: '18/12/2026',
+});
+const payload = Object.fromEntries(new URLSearchParams(payloadRes.body));
 console.log(`   ${JSON.stringify(payload, null, 2).split('\n').join('\n   ')}`);
 check('keyid = celui du logement choisi', payload.keyid, '3AG104A');
+check('toggle du logement choisi coché', payload.check_logement_3AG104A, 'on');
 check('nb_occupants recalculé depuis SA ligne (pas la valeur figée du form)', payload.nb_occupants, '1');
 check('est_caution_solidaire recalculé', payload.est_caution_solidaire, '0');
 check('action conservée', payload.action, 'validation_reservation');
@@ -236,17 +243,31 @@ const PAGE_ECHEC = `<html><body>
 const PAGE_SUCCES = `<html><body>
   <div id="submit_reservation_error" style="display:none;"><span id="submit_reservation_error_message"></span></div>
   <h4>Votre réservation est enregistrée.</h4></body></html>`;
+// Page du compte : c'est ELLE qui fait foi désormais (relue après chaque POST).
+const COMPTE_VIDE = `<html><body>Vous n'avez aucun bien en location ou réservé.</body></html>`;
+const COMPTE_RESERVE = `<html><body><h4>Votre réservation a bien été enregistrée.</h4></body></html>`;
+
+// Le fallback navigateur n'a pas sa place dans un test hors ligne : sans lui,
+// un échec HTTP reste un échec, ce qui est exactement ce qu'on veut vérifier.
+config.browserFallback = false;
 
 const appels = [];
+let reservationPrise = false;
 globalThis.fetch = async (url, opts = {}) => {
   const u = String(url);
-  appels.push({ url: u, body: opts.body });
+  const method = (opts.method || 'GET').toUpperCase();
+  appels.push({ url: u, body: opts.body, method });
   if (u.includes('api.telegram.org')) {
     return { ok: true, status: 200, text: async () => '{"ok":true}' };
   }
-  // 1re validation → refusée par le site ; 2e → acceptée.
-  const nCesal = appels.filter((a) => a.url.includes('cesal.fr')).length;
-  return { status: 200, text: async () => (nCesal === 1 ? PAGE_ECHEC : PAGE_SUCCES) };
+  // GET = relecture de la page du compte (vérification du résultat réel).
+  if (method === 'GET') {
+    return { ok: true, status: 200, headers: new Map(), text: async () => (reservationPrise ? COMPTE_RESERVE : COMPTE_VIDE) };
+  }
+  // POST de validation : la 1re est refusée par le site, la 2e acceptée.
+  const nPosts = appels.filter((a) => a.url.includes('cesal.fr') && a.method === 'POST').length;
+  if (nPosts >= 2) reservationPrise = true;
+  return { ok: true, status: 200, headers: new Map(), text: async () => (nPosts === 1 ? PAGE_ECHEC : PAGE_SUCCES) };
 };
 
 // L'état "déjà vu" et les dumps sont sauvegardés puis restaurés : un test ne
@@ -260,11 +281,16 @@ const res = await handleAvailability(html, 'PHPSESSID=fake', {
   commit: true,
 });
 
-const validations = appels.filter((a) => a.url.includes('cesal.fr'));
+const validations = appels.filter((a) => a.url.includes('cesal.fr') && a.method === 'POST');
 const keyidsEnvoyes = validations.map((a) => new URLSearchParams(a.body).get('keyid'));
 check('2 validations tentées (la 1re refusée, on enchaîne)', validations.length, 2);
 check('ordre des tentatives', keyidsEnvoyes, ['3AG104A', '4BD003A']);
 check('réservation finalement obtenue', res.reserved, true);
+check(
+  'le compte a été relu après chaque tentative (la preuve, pas la supposition)',
+  appels.filter((a) => a.url.includes('cesal.fr') && a.method === 'GET').length,
+  2
+);
 check('logement réservé', res.chosen.code, '4BD003');
 check(
   'nb_occupants correct sur la 2e tentative',
