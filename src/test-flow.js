@@ -14,7 +14,7 @@ import { notify, notifyPhoto, escapeHtml } from './notify.js';
  * à tout moment, même sans logement réellement dispo.
  *
  * Lancer sur le VPS via :
- *   fly ssh console -a sarzal -C "node src/test-flow.js"
+ *   fly ssh console -a sarzal-crfugg -C "node src/test-flow.js"
  */
 async function main() {
   await notify('🧪 <b>Test de flux (lecture seule, aucune réservation)</b> — démarrage…');

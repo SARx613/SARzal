@@ -51,7 +51,7 @@ contente d'afficher le corps exact du POST qu'il aurait envoyé. Le bilan part
 aussi sur Telegram, donc c'est utilisable depuis le serveur :
 
 ```bash
-fly ssh console -a sarzal -C "node src/diagnostic.js"
+fly ssh console -a sarzal-crfugg -C "node src/diagnostic.js"
 ```
 
 À lancer **maintenant**, sans attendre une dispo : les deux points qu'il valide

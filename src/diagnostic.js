@@ -13,7 +13,7 @@
  * GET de la page. Rien de plus.
  *
  *   npm run diagnostic
- *   fly ssh console -a sarzal -C "node src/diagnostic.js"
+ *   fly ssh console -a sarzal-crfugg -C "node src/diagnostic.js"
  */
 import fs from 'fs';
 import { config, URLS, STORAGE_STATE } from './config.js';

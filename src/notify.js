@@ -16,6 +16,19 @@ export function escapeHtml(str) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /**
+ * Préfixe identifiant l'instance qui parle (`INSTANCE_NAME`).
+ *
+ * Quand le bot tourne simultanément sur le Mac et sur le VPS, les deux écrivent
+ * dans le même chat Telegram. Sans ce préfixe, deux alertes identiques arrivent
+ * et rien ne dit laquelle des deux a effectivement réservé. Le nom est échappé :
+ * il vient d'une variable d'environnement et part dans un message parse_mode HTML.
+ */
+function withInstance(text) {
+  const name = config.instanceName;
+  return name ? `[${escapeHtml(name)}] ${text}` : text;
+}
+
+/**
  * Appel Telegram avec RETRY. Un message d'alerte perdu = une occasion de
  * réservation perdue : on ne se contente donc plus d'un seul essai silencieux.
  *
@@ -87,7 +100,7 @@ export async function notify(text) {
     console.warn('[NOTIFY] Telegram non configuré (token/chat_id manquant) — message non envoyé.');
     return false;
   }
-  const body = truncate(text);
+  const body = truncate(withInstance(text));
   const res = await callTelegram('sendMessage', {
     chat_id: config.telegramChatId,
     text: body,
@@ -127,7 +140,7 @@ export async function notifyPhoto(caption, screenshotBuffer) {
   if (!config.telegramToken || !config.telegramChatId) return false;
   const formData = new FormData();
   formData.append('chat_id', String(config.telegramChatId));
-  formData.append('caption', truncate(caption).slice(0, 1000));
+  formData.append('caption', truncate(withInstance(caption)).slice(0, 1000));
   formData.append('parse_mode', 'HTML');
   formData.append('photo', new Blob([screenshotBuffer], { type: 'image/png' }), 'step.png');
   const res = await callTelegram('sendPhoto', formData, { isFormData: true });
@@ -148,7 +161,7 @@ export async function notifyDocument(caption, buffer, filename) {
   if (!config.telegramToken || !config.telegramChatId) return false;
   const formData = new FormData();
   formData.append('chat_id', String(config.telegramChatId));
-  formData.append('caption', truncate(caption).slice(0, 1000));
+  formData.append('caption', truncate(withInstance(caption)).slice(0, 1000));
   formData.append('parse_mode', 'HTML');
   formData.append('document', new Blob([buffer], { type: 'text/html' }), filename);
   const res = await callTelegram('sendDocument', formData, { isFormData: true });

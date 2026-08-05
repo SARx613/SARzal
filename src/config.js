@@ -10,6 +10,18 @@ export const config = {
   intervalMinutes: parseInt(process.env.INTERVAL_MINUTES || '10', 10),
   headless: process.env.HEADLESS !== 'false',
 
+  // Nom de cette instance, préfixé à chaque message Telegram. Quand le bot
+  // tourne à la fois sur le Mac et sur le VPS, les deux écrivent dans le MÊME
+  // chat : sans ce préfixe, impossible de savoir laquelle a vu quoi (ni
+  // laquelle a réservé). Vide = pas de préfixe (comportement d'avant).
+  instanceName: process.env.INSTANCE_NAME || '',
+
+  // true → le Chromium de la réservation s'ouvre VISIBLE à l'écran, au lieu de
+  // tourner en headless. Réservé au Mac : sur le VPS il n'y a pas d'affichage.
+  // Le site (jQuery/select2/AJAX) se comporte mieux dans une vraie fenêtre, et
+  // ça permet de reprendre la main à la souris si le bot se coince.
+  showBrowser: process.env.SHOW_BROWSER === 'true',
+
   // ── Surveillance rapide (fetch HTTP pur, pas de navigateur permanent) ──────
   // Intervalle de base entre deux checks, en SECONDES — identique jour et nuit
   // (pas de ralentissement nocturne). Défaut 3s ; ajustable via le secret Fly
